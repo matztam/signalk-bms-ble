@@ -11,6 +11,18 @@ one JSON object per line to stdout for every successful reading. All logging
 goes to stderr so stdout stays clean newline-delimited JSON for the parent
 Node process.
 
+Single long-lived process (one BleakScanner, one asyncio event loop, for the
+worker's whole lifetime) rather than a subprocess per poll attempt — a
+previous per-poll-subprocess design was too heavy for a memory-constrained
+Raspberry Pi (416MB RAM), where several concurrent Python interpreters
+pushed the system into swapping and made SignalK itself unresponsive. See
+diag/findings/PROTOCOL_NOTES.md for that investigation. The tradeoff: a rare
+BlueZ/DBus hang (observed once, see WATCHDOG_TIMEOUT_S) can no longer be
+isolated to a throwaway subprocess, so a watchdog thread hard-exits this
+whole process if a poll attempt doesn't return in time; the parent
+(lib/bleWorker.js) already auto-restarts a dead worker, so this just costs
+one reconnect cycle instead of hanging forever.
+
 Devices are configured via the BMS_DEVICES env var, MAC address and brand
 are never hardcoded: a JSON array like
   [{"id": "house-1", "type": "jk", "address": "11:22:33:44:55:66"},
@@ -29,28 +41,21 @@ or on error:
 import asyncio
 import json
 import os
-import subprocess
 import sys
+import threading
 import time
 
 from bleak import BleakClient, BleakScanner
 
 POLL_INTERVAL_S = 5
-CONNECT_TIMEOUT_S = 15
-# Only used as a fallback (SKIP_DISCOVERY_ENV unset, e.g. if the background
-# scanner subprocess died) - the normal path relies on start_background_scanner()
-# instead. See its docstring for why per-device discovery was replaced.
 DISCOVER_TIMEOUT_S = 12
-# Give the background scanner a few seconds to build up its device cache
-# before the first poll attempt relies on it having already seen everyone.
-SCANNER_WARMUP_S = 5
-# Hard ceiling enforced from OUTSIDE the asyncio event loop (see
-# poll_once_isolated below) - a plain asyncio.wait_for() was not enough:
-# BlueZ/DBus occasionally leaves a connect attempt blocked in a kernel wait
-# (epoll_wait on a DBus reply that never arrives) that asyncio's cooperative
-# cancellation cannot interrupt, observed live to hang for minutes. Running
-# each poll attempt as its own OS subprocess lets the parent SIGKILL it.
-SUBPROCESS_TIMEOUT_S = DISCOVER_TIMEOUT_S + CONNECT_TIMEOUT_S + 10
+CONNECT_TIMEOUT_S = 15
+# Hard ceiling for a single device's poll attempt (discovery + connect +
+# read), enforced by a watchdog thread that os._exit()s the whole process
+# if exceeded - see module docstring for why a plain asyncio timeout is not
+# trusted to be enough on its own (BlueZ/DBus can leave a coroutine blocked
+# in a kernel wait that asyncio's cooperative cancellation can't interrupt).
+WATCHDOG_TIMEOUT_S = DISCOVER_TIMEOUT_S + CONNECT_TIMEOUT_S + 10
 
 
 def log(msg):
@@ -255,37 +260,72 @@ PROTOCOLS = {
 }
 
 
-async def ensure_discoverable(address: str):
-    """BlueZ drops a device from its cache if it hasn't advertised recently,
-    and BleakClient(address) then fails with BleakDeviceNotFoundError even
-    though the device is in range and would answer a fresh scan. Do a short
-    targeted scan first so the connect attempt has a live cache entry.
+class Watchdog:
+    """Pets itself before/after every poll attempt; a background thread
+    checks whether it's been fed recently and hard-exits the process if
+    not. This is the only reliable way found to escape a BlueZ/DBus call
+    that never returns and doesn't respond to asyncio cancellation (see
+    module docstring) without paying for a subprocess per poll."""
 
-    Only used when SKIP_DISCOVERY_ENV is not set - see module docstring /
-    background_scanner() for why the normal round-robin path skips this
-    entirely in favor of one long-lived scan in the parent process."""
-    found = await BleakScanner.find_device_by_address(address, timeout=DISCOVER_TIMEOUT_S)
-    if found is None:
-        raise TimeoutError(f"{address} did not advertise within {DISCOVER_TIMEOUT_S}s")
+    def __init__(self, timeout_s: float):
+        self._timeout_s = timeout_s
+        self._last_pet = time.monotonic()
+        self._current_device = None
+        self._stop = False
+
+    def pet(self, device_id=None):
+        self._last_pet = time.monotonic()
+        self._current_device = device_id
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        while not self._stop:
+            time.sleep(1)
+            if time.monotonic() - self._last_pet > self._timeout_s:
+                log(
+                    f"watchdog: no progress for {self._timeout_s:.0f}s "
+                    f"(stuck on {self._current_device!r}) - exiting so the "
+                    "supervisor can restart us"
+                )
+                sys.stderr.flush()
+                sys.stdout.flush()
+                os._exit(1)  # deliberately skips cleanup - a clean shutdown
+                # is exactly what's not possible if bleak/BlueZ is wedged.
 
 
-# Set by the parent process (see poll_once_isolated) once its own
-# background_scanner() has been running long enough that BlueZ's systemwide
-# device cache (shared across processes via DBus - confirmed live: one
-# process's scan results are visible to `bluetoothctl devices` run from a
-# completely different process) should already know about all configured
-# devices. When set, the isolated --poll-one subprocess skips doing its own
-# discovery scan and connects directly.
-SKIP_DISCOVERY_ENV = "BMS_SKIP_DISCOVERY"
+async def ensure_discoverable(scanner: BleakScanner, address: str):
+    """Wait for `address` to show up in the shared, already-running
+    scanner's live device list. No per-device start/stop of discovery:
+    that was found to make BlueZ stop reporting fresh advertisements for
+    anyone but the first device polled in a cycle - see
+    diag/findings/PROTOCOL_NOTES.md."""
+    address = address.lower()
+    deadline = asyncio.get_event_loop().time() + DISCOVER_TIMEOUT_S
+    while asyncio.get_event_loop().time() < deadline:
+        for dev in scanner.discovered_devices:
+            if dev.address.lower() == address:
+                return
+        await asyncio.sleep(0.2)
+    raise TimeoutError(f"{address} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
 
 
-async def poll_once(device: dict) -> dict:
+async def poll_once(scanner: BleakScanner, device: dict) -> dict:
     protocol_cls = PROTOCOLS[device["type"]]
     protocol = protocol_cls()
 
-    async def _do():
-        if not os.environ.get(SKIP_DISCOVERY_ENV):
-            await ensure_discoverable(device["address"])
+    await ensure_discoverable(scanner, device["address"])
+
+    # A running discovery session and an active connect attempt both want
+    # exclusive use of the adapter; leaving the scanner going during
+    # connect() reliably produced "org.bluez.Error.InProgress" on every
+    # single attempt (observed live). Stop it for the duration of the
+    # connect+read and resume right after, so devices don't age out of the
+    # scanner's cache between polls (see ensure_discoverable / PROTOCOL_NOTES
+    # for why leaving discovery running otherwise is worth the complexity).
+    await scanner.stop()
+    try:
         async with BleakClient(device["address"], timeout=CONNECT_TIMEOUT_S) as client:
             # BlueZ sometimes reports the connection as established before
             # GATT service resolution has actually finished, causing an
@@ -295,105 +335,27 @@ async def poll_once(device: dict) -> dict:
             # built-in wait for "services truly ready").
             await asyncio.sleep(1.5)
             return await protocol.read(client)
-
-    # Soft timeout on top of bleak's own per-call timeouts, in case
-    # cancellation does get through cleanly - the hard backstop against
-    # BlueZ/DBus calls that don't respond to cancellation at all is the
-    # subprocess-level SIGKILL in poll_once_isolated() below.
-    overall_timeout = DISCOVER_TIMEOUT_S + CONNECT_TIMEOUT_S + 5
-    return await asyncio.wait_for(_do(), timeout=overall_timeout)
+    finally:
+        await scanner.start()
 
 
-def poll_once_isolated(device: dict, skip_discovery: bool) -> dict:
-    """Run poll_once() for one device in its own subprocess (this same
-    script, re-invoked with --poll-one) and hard-kill it if it doesn't
-    finish in time. See SUBPROCESS_TIMEOUT_S for why this is necessary
-    instead of just an asyncio timeout."""
-    env = dict(os.environ)
-    if skip_discovery:
-        env[SKIP_DISCOVERY_ENV] = "1"
-    proc = subprocess.run(
-        [sys.executable, __file__, "--poll-one", json.dumps(device)],
-        capture_output=True,
-        text=True,
-        timeout=SUBPROCESS_TIMEOUT_S,
-        env=env,
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
-        reason = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit code {proc.returncode}, no output"
-        raise RuntimeError(reason)
-    return json.loads(proc.stdout.strip().splitlines()[-1])
-
-
-def start_background_scanner():
-    """Launch a standalone subprocess that keeps a single BLE discovery
-    session running for the worker's whole lifetime, in place of each
-    poll_once() starting/stopping its own scan. Root cause investigation
-    (see diag/findings/PROTOCOL_NOTES.md) found that repeatedly starting
-    and stopping discovery, once per device, left BlueZ unable to report
-    fresh advertisements for anyone but the first device polled in a
-    cycle - independent of which physical device that was. BlueZ's device
-    cache is shared systemwide over DBus (confirmed live: `bluetoothctl
-    devices` run from a separate process sees results from this scan), so
-    the isolated --poll-one subprocesses can skip discovery entirely
-    (SKIP_DISCOVERY_ENV) and connect directly once this has been running
-    a few seconds.
-
-    Returns the Popen handle; caller is responsible for keeping it alive
-    and terminating it on shutdown."""
-    return subprocess.Popen(
-        [sys.executable, "-c", (
-            "import asyncio\n"
-            "from bleak import BleakScanner\n"
-            "async def main():\n"
-            "    async with BleakScanner():\n"
-            "        await asyncio.Event().wait()\n"
-            "asyncio.run(main())\n"
-        )],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def round_robin(devices: list):
-    """Poll all configured devices one at a time, forever. A single BLE
-    adapter can only drive one GATT connection attempt at a time, so devices
-    are visited in sequence rather than concurrently."""
-    scanner_proc = start_background_scanner()
-    log(f"Background scanner started (pid={scanner_proc.pid}), warming up for {SCANNER_WARMUP_S}s")
-    time.sleep(SCANNER_WARMUP_S)
-
-    try:
+async def round_robin(devices: list, watchdog: Watchdog):
+    """Poll all configured devices one at a time, forever, in a single
+    long-lived scanner session. A single BLE adapter can only drive one
+    GATT connection attempt at a time, so devices are visited in sequence
+    rather than concurrently."""
+    async with BleakScanner() as scanner:
         while True:
             for device in devices:
-                skip_discovery = scanner_proc.poll() is None  # still running?
+                watchdog.pet(device["id"])
                 try:
-                    reading = poll_once_isolated(device, skip_discovery)
+                    reading = await poll_once(scanner, device)
                     emit({"id": device["id"], **reading})
-                except subprocess.TimeoutExpired:
-                    msg = f"poll subprocess did not finish within {SUBPROCESS_TIMEOUT_S}s, killed"
-                    log(f"{device['id']} ({device['address']}): {msg}")
-                    emit({"id": device["id"], "error": msg})
                 except Exception as exc:  # noqa: BLE001 - report and keep going
                     log(f"{device['id']} ({device['address']}): {exc!r}")
                     emit({"id": device["id"], "error": str(exc)})
-            time.sleep(POLL_INTERVAL_S)
-    finally:
-        scanner_proc.terminate()
-
-
-def run_poll_one(device: dict):
-    """Entry point used by the isolated subprocess (see poll_once_isolated):
-    poll exactly one device once, print the JSON result to stdout on
-    success. On failure, print the error to stderr (parent logs it) and
-    exit non-zero - deliberately no traceback noise, connect failures are
-    an expected, routine outcome here, not a bug."""
-    try:
-        reading = asyncio.run(poll_once(device))
-    except Exception as exc:  # noqa: BLE001 - report to parent and exit
-        print(repr(exc), file=sys.stderr)
-        sys.exit(1)
-    print(json.dumps(reading))
+            watchdog.pet()  # idle between cycles shouldn't count as "stuck"
+            await asyncio.sleep(POLL_INTERVAL_S)
 
 
 def main():
@@ -409,12 +371,12 @@ def main():
     if not devices:
         return
 
+    watchdog = Watchdog(WATCHDOG_TIMEOUT_S)
+    threading.Thread(target=watchdog.run, daemon=True).start()
+
     log(f"Starting round-robin polling for {len(devices)} device(s), interval={POLL_INTERVAL_S}s")
-    round_robin(devices)
+    asyncio.run(round_robin(devices, watchdog))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--poll-one":
-        run_poll_one(json.loads(sys.argv[2]))
-    else:
-        main()
+    main()

@@ -6,17 +6,24 @@ Daly Smart BMS Geräten über Bluetooth LE ausliest und unter
 
 ## Architektur
 
-- `ble_worker.py` — Python-Subprozess (via `bleak`/BlueZ-DBus), verbindet
-  sich der Reihe nach mit jedem konfigurierten BMS, fragt Live-Daten ab und
-  gibt sie zeilenweise als JSON auf stdout aus. Läuft in einer eigenen venv
-  (`.venv/`, wird beim ersten Plugin-Start automatisch angelegt).
+- `ble_worker.py` — **ein einziger langlebiger** Python-Prozess (via
+  `bleak`/BlueZ-DBus), der über die gesamte Laufzeit einen `BleakScanner`
+  offen hält und alle konfigurierten BMS der Reihe nach abfragt (ein
+  Adapter kann immer nur eine GATT-Verbindung gleichzeitig aufbauen).
+  Ergebnisse gehen zeilenweise als JSON auf stdout. Läuft in einer eigenen
+  venv (`.venv/`, wird beim ersten Plugin-Start automatisch angelegt). Ein
+  Watchdog-Thread beendet den ganzen Prozess hart, falls ein Poll-Versuch
+  hängen bleibt (siehe Kommentare in `ble_worker.py` und
+  `diag/findings/PROTOCOL_NOTES.md` für die Vorgeschichte: ein früherer
+  Subprozess-pro-Poll-Ansatz war auf einem RAM-armen Pi zu schwer und hat
+  SignalK selbst lahmgelegt).
 - `lib/bleWorker.js` — spawnt/überwacht den Python-Prozess, parst dessen
   JSON-Zeilen, startet ihn bei Absturz automatisch neu.
 - `index.js` — SignalK-Plugin-Entry-Point: Konfigurations-Schema (Geräteliste),
   wandelt Readings in SignalK-Deltas um, zeigt die letzten Werte live auf der
   Plugin-Config-Seite an.
 
-**Warum ein Python-Subprozess statt eines reinen Node-BLE-Moduls?**
+**Warum ein Python-Prozess statt eines reinen Node-BLE-Moduls?**
 `@abandonware/noble` braucht meist exklusiven HCI-Zugriff und kollidiert mit
 laufendem `bluetoothd`. `node-ble` (DBus/BlueZ, wie bleak) wurde getestet,
 hing aber beim Connect unbegrenzt fest, ohne eigenes Timeout. `bleak` ist die
@@ -55,12 +62,18 @@ Alle drei sind elektrisch 4S-Packs (nicht 8S, trotz JK-Modellbezeichnung
 
 - Entladefall (negativer Strom) beim Daly-Protokoll ist bisher nur anhand der
   Registerformel verifiziert, nicht mit echter Entladelast gegengetestet.
-- BLE-Verbindungsstabilität war beim Testen auf dem Laptop schwankend
-  (siehe PROTOCOL_NOTES.md) — auf dem Ziel-Pi erneut beobachten.
 - Kein Pairing/Bonding nötig; eine offene GATT-Verbindung reicht für alle
   drei Geräte. Nur eine Verbindung pro BMS gleichzeitig möglich — die
   Original-Handy-Apps dürfen während des Plugin-Betriebs nicht gleichzeitig
   verbunden sein.
+- **Erster Deployment-Versuch auf einem Raspberry Pi mit nur 416MB RAM
+  scheiterte**: der damalige Subprozess-pro-Poll-Ansatz (mehrere gleichzeitig
+  laufende Python-Interpreter) brachte den Pi zum Swappen und SignalK
+  reagierte gar nicht mehr — Details in PROTOCOL_NOTES.md. Deshalb der
+  Umbau auf einen einzigen Dauerprozess. Auf so einem Pi ist trotzdem
+  Vorsicht geboten: RAM-Headroom vor dem Deploy prüfen (`free -h`), und
+  nicht gleichzeitig mit anderen RAM-hungrigen Setup-Vorgängen
+  (z.B. Erstinstallation anderer Plugins) deployen.
 
 ## Lokale Installation (SignalK auf diesem Rechner)
 

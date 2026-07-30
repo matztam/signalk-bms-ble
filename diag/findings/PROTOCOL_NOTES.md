@@ -166,3 +166,55 @@ zuverlässig funktioniert.
    isolierten Diagnose-Skript-Läufen — noch unklar, wie viel davon USB-Adapter-/Umgebungs-
    spezifisch ist und wie viel sich auf dem späteren Pi (ggf. mit Onboard-BT oder anderem
    Adapter) reproduziert. Vor Produktivbetrieb auf dem Pi erneut beobachten.
+
+## Erster Pi-Deployment-Versuch gescheitert: Subprozess-Architektur zu schwer (2026-07-30)
+
+Der Subprozess-pro-Poll-Ansatz (Hintergrund-Scanner-Subprozess + isolierter
+`--poll-one`-Subprozess je Gerät, siehe oben) funktionierte auf dem Laptop
+zuverlässig, hat aber den Ziel-Pi (416MB RAM, `free -h` zeigte im Normalbetrieb
+schon nur ~80-120MB verfügbar) überlastet: mehrere gleichzeitig laufende
+Python-Interpreter (venv-Overhead pro Prozess) plus ein zeitgleich laufender
+`pip install` von `signalk-beluga-core` (dessen eigene venv-Erstinstallation)
+trieben die Load auf 9-12 und den Server ins Swappen. Folge: SignalK
+antwortete auf HTTP-Anfragen nicht mehr (`curl` gegen Port 80 lokal auf dem
+Pi lieferte `HTTP:000`), das Admin-UI war für den Nutzer nicht mehr
+erreichbar. Deaktivieren des Plugins (`enabled: false` in der
+Plugin-Config-Datei) reichte NICHT aus, um es zu stoppen — SignalK scheint
+den `enabled`-Status nicht live zu respektieren, sondern nur beim Laden des
+Plugins aus `node_modules`. Was tatsächlich half:
+1. Den Plugin-Symlink aus `~/.signalk/node_modules/` entfernen (verhindert,
+   dass SignalK das Plugin überhaupt findet/lädt).
+2. Sauberer `sudo reboot` (nicht Strom trennen — Dateisystem-Risiko), da der
+   Pi durch die hohe Last so verlangsamt war, dass selbst einzelne SSH-Befehle
+   wiederholt mit Verbindungsabbrüchen scheiterten.
+
+**Fix: kompletter Umbau von "Subprozess pro Poll-Versuch" auf "ein einziger
+Dauerprozess"** (siehe aktueller Code in `ble_worker.py`), nach dem Vorbild
+von `signalk-victron-ble` (ebenfalls Python/bleak-basiert, aber als ein
+einziger `asyncio.run()`-Aufruf für die gesamte Laufzeit implementiert — dort
+allerdings technisch einfacher, weil Victron-BLE passiv aus
+Advertisement-Paketen liest statt aktiv GATT-Connects zu machen wie JK/Daly).
+
+Wichtige Design-Änderungen beim Umbau:
+- Ein `BleakScanner` läuft als `async with`-Context für die komplette
+  Worker-Lebensdauer statt als separater Subprozess.
+- **Neu gefundenes Problem dabei**: den Scanner permanent parallel zum
+  `BleakClient.connect()` laufen zu lassen erzeugt bei JEDEM Connect-Versuch
+  `org.bluez.Error.InProgress` (reproduzierbar, 100% der Fälle) — Scanner und
+  Connect konkurrieren um denselben Adapter. Fix: `scanner.stop()` unmittelbar
+  vor jedem `BleakClient`-Connect, `scanner.start()` im `finally`-Block direkt
+  danach. Mit diesem Fix: 3/3 Zyklen (9/9 Leseversuche) auf dem Laptop
+  fehlerfrei erfolgreich.
+- Statt der Subprozess-SIGKILL-Absicherung gegen hängende BlueZ/DBus-Calls
+  (siehe oben) übernimmt jetzt ein **Watchdog-Thread** diese Rolle: er wird
+  vor/nach jedem Poll-Versuch "gefüttert" und beendet den gesamten
+  Python-Prozess per `os._exit(1)`, falls er `WATCHDOG_TIMEOUT_S` lang keine
+  Fütterung sieht. `lib/bleWorker.js` startet den toten Prozess automatisch
+  neu (bereits vorhandene Resilience-Logik) — kostet im Hängefall einen
+  Reconnect-Zyklus statt eines zusätzlichen Subprozesses pro Poll.
+- Ergebnis: nur noch EIN Python-Prozess über die gesamte Laufzeit (statt
+  bis zu 3-4 gleichzeitig), massiv geringerer RAM/CPU-Fußabdruck.
+
+**Noch nicht erneut auf dem Pi getestet** — nächster Schritt vor dem nächsten
+Deploy-Versuch: erneut sicherstellen, dass keine andere RAM-hungrige
+Installation (z.B. `pip install`/venv-Builds anderer Plugins) parallel läuft.
