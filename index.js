@@ -180,7 +180,10 @@ module.exports = function (app) {
 
     const path = `electrical.batteries.${id}`
     const values = [
-      { path: `${path}.stateOfCharge`, value: msg.soc / 100 },
+      // SignalK spec puts state of charge under capacity, not as a
+      // top-level battery field - signalk-to-nmea2000 (and other
+      // spec-conformant consumers) only pick it up from there.
+      { path: `${path}.capacity.stateOfCharge`, value: msg.soc / 100 },
       { path: `${path}.voltage`, value: msg.packVoltage },
       { path: `${path}.current`, value: msg.current }
     ]
