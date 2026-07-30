@@ -1,0 +1,168 @@
+# Verifizierte Protokoll-Details (Stand 2026-07-30, Test auf Laptop development laptop)
+
+## Geräte-Zuordnung (BLE MAC-Adressen)
+
+- **JK-BMS** "Example-BMS" (JK-B2A8S20P): `11:22:33:44:55:66`
+- **Daly BMS 1**: `11:22:33:44:55:67` (Name: `DL-EXAMPLE1`)
+- **Daly BMS 2**: `11:22:33:44:55:68` (Name: `DL-EXAMPLE2`)
+- Balancer-eigene BLE-Geräte (NICHT relevant, ignorieren): `11:22:33:44:55:69`, `11:22:33:44:55:6a`
+
+## JK-BMS (JK02-Protokoll, Header `55 AA EB 90`)
+
+- Service `0000ffe0`, Characteristic `0000ffe1` (write + notify).
+- Request: `AA 55 90 EB 96 00` + 13×`00` + 1-Byte-Checksumme (simple sum) = COMMAND_CELL_INFO.
+- BMS antwortet fortlaufend mit drei Frame-Typen (gleicher Request triggert alle):
+  - `data[4]=0x01`: Settings-Frame (Limits, nicht die Live-Werte!)
+  - `data[4]=0x02`: **Cell-Info-Frame — das brauchen wir.** Fixe Länge 300 Bytes,
+    kommt in BLE-Notify-Chunks (128+128+44 Bytes hier beobachtet).
+  - `data[4]=0x03`: Device-Info-Frame (Modellname, Gerätename, Seriennummer als ASCII)
+- Checksum Cell-Info-Frame: simple Byte-Summe über data[0..298], Ergebnis in data[299]. Verifiziert (match).
+- **Wichtige Abweichung von esphome-jk-bms Referenzcode**: Unser Gerät nutzt einen
+  Feld-Offset von **32** (nicht 0 wie JK02_24S, nicht 16 wie JK02_32S) für die
+  Blöcke ab Byte 118. Vermutlich eine weitere Board-Variante. Byte-Layout:
+  - Zellspannungen: `cell[i] = get_u16(6 + i*2) * 0.001` V — **kein Offset**, ab Byte 6, unverändert.
+  - Pack-Spannung: `get_u32(118+32=150) * 0.001` V
+  - Strom (signed): `get_i32(126+32=158) * 0.001` A
+  - SOC: `data[141+32=173]` (uint8, direkt %)
+  - Getestet/verifiziert mit echten Daten: 4 Zellen à ~3.33V, Summe 13.33V,
+    Pack-Spannung-Feld exakt 13.326V (stimmt), SOC 65%, Strom 4.821A — alles plausibel.
+  - **Falls sich das Verhalten künftig ändert** (z.B. nach Firmware-Update, oder
+    bei mehr aktiven Zellen): Offset-Hypothese erneut gegen Zellspannungssumme
+    verifizieren, da unklar ist, ob es an der tatsächlichen Zellenzahl hängt.
+- Nur 4 von 8 möglichen Zellslots sind belegt → das Pack ist elektrisch 4S,
+  trotz Modellbezeichnung "B2A8S20P" (8S = max. unterstützte Zellenzahl des Boards).
+
+## Daly Smart BMS (D2-Dialekt, Modbus-RTU-artig, Header `D2 03`)
+
+- Service `0000fff0`, notify `0000fff1`, write `0000fff2`.
+- Request: `D2 03 00 00 00 3E` + CRC16/Modbus (LE) = `D7 B9`. Liest 62 Register ab 0x0000.
+- Response: `D2 03 7C` + 124 Bytes Daten (62 × uint16 BE) + CRC16/Modbus (LE). CRC verifiziert exakt.
+- Register-Layout (bestätigt via github.com/syssi/esphome-daly-bms docs/protocol-register-map.md,
+  UND durch eigene Cross-Validierung Zellsumme≈Pack-Spannung):
+  - Zellspannung N (1-basiert): register `0x00 + (N-1)`, uint16 BE, ×0.001 V
+  - Zellenzahl: register `0x31` (bei uns: 4 → 4S-Pack, nicht 8S/mehr)
+  - Pack-Gesamtspannung: register `0x28`, uint16 BE, ×0.1 V
+  - Strom: register `0x29`, uint16 BE, **(raw − 30000) × 0.1 A** (Daly-typischer Offset,
+    negative Werte = Entladung, positive = Ladung — Vorzeichen noch nicht live mit
+    tatsächlicher Entladung gegengetestet, nur Ladefall beobachtet)
+  - SOC: register `0x2A`, uint16 BE, ×0.1 %
+  - Max. Zellspannung: register `0x2B`, uint16 BE, ×0.001 V
+- Verifiziert mit echten Daten (beide BMS):
+  - BMS1: 4 Zellen [3.355, 3.363, 3.356, 3.362]V, Summe 13.436V, Pack-Spannung-Feld 13.4V ✓, SOC 56.1%, Strom +18.9A
+  - BMS2: 4 Zellen [3.342, 3.351, 3.352, 3.337]V, Summe 13.382V, Pack-Spannung-Feld 13.3V ✓, SOC 62.2%, Strom +18.0A
+- Beide Daly-BMS sind ebenfalls 4S-Packs (13S/4S ~13.3-13.4V ≈ 4×LFP), passend zum JK-BMS.
+
+## JK-BMS: zweiter Request nötig, um Live-Daten zu triggern
+
+Ein einzelner `0x96`-("cell info")-Request liefert vom getesteten Gerät NUR die
+`0x01`(Settings)- und `0x03`(Device-Info)-Frames, keinen `0x02`(Cell-Info)-Frame.
+Erst ein zusätzlicher `0x97`("device info")-Request bringt das BMS dazu, danach
+laufend (alle ~0.4s) `0x02`-Frames zu pushen. Reproduzierbar über mehrere
+Verbindungen bestätigt. `JkProtocol.extra_requests()` in `ble_worker.py` sendet
+deshalb den `0x97`-Request automatisch nach, falls die erste Antwort nach 1.5s
+noch kein Cell-Info-Frame war. Grund für das Geräteverhalten unklar
+(evtl. wird der periodische Push erst durch eine zweite "Aktivität" auf dem
+UART-Bridge-Chip angestoßen) — nicht weiter untersucht, da der Workaround
+zuverlässig funktioniert.
+
+## BLE-Adapter-Stabilität (Laptop development laptop, USB-BT-Adapter)
+
+- Nach vielen aufeinanderfolgenden Verbindungsversuchen/-abbrüchen (z.B. durch
+  Testläufe, die per `timeout` hart gekillt wurden statt sauber zu disconnecten)
+  gerät `bluetoothd` in einen Zustand, in dem `BleakScanner.discover()` Geräte
+  nicht mehr findet, obwohl sie nachweislich in Reichweite und aktiv sind
+  (mit dem Handy verbindbar). Symptom: alle drei BMS verschwinden aus
+  `bluetoothctl devices`. Fix: `sudo systemctl restart bluetooth`. Nach dem
+  Neustart sind alle drei sofort wieder sichtbar.
+- Einmal beobachtet: ein `BleakClient`-Connect hing >80s fest, obwohl
+  `DISCOVER_TIMEOUT_S=8` und `CONNECT_TIMEOUT_S=15` konfiguriert waren —
+  bleak/BlueZ-DBus scheint das eigene Timeout in seltenen Fällen nicht
+  durchzusetzen. Fix: `poll_once()` in `ble_worker.py` wickelt jetzt den
+  gesamten Discover+Connect+Read-Vorgang zusätzlich in ein äußeres
+  `asyncio.wait_for(..., timeout=DISCOVER_TIMEOUT_S + CONNECT_TIMEOUT_S + 5)`,
+  damit ein hängendes Gerät nie länger als ~28s blockiert (statt potentiell
+  unbegrenzt).
+  - **Einschränkung dieses Fixes**: `asyncio.wait_for`-Cancellation ist
+    kooperativ — wenn der abgebrochene Code selbst in einem blockierenden
+    DBus-Call hängt (`epoll_wait` auf eine DBus-Antwort, die nie kommt —
+    per `cat /proc/<pid>/wchan` bestätigt), kehrt die Coroutine trotzdem
+    nicht zurück, egal wie das Timeout konfiguriert ist. Live beobachtet:
+    ein Worker-Prozess hing >4 Minuten fest, mit `asyncio.wait_for`-Timeout
+    von nur ~28s konfiguriert.
+  - **Endgültiger Fix**: `poll_once()` läuft jetzt nicht mehr im
+    Haupt-Event-Loop, sondern wird für jeden Poll-Versuch als eigener
+    kurzlebiger Subprozess gestartet (`ble_worker.py --poll-one '<json>'`,
+    siehe `poll_once_isolated()`). Der Elternprozess nutzt
+    `subprocess.run(..., timeout=SUBPROCESS_TIMEOUT_S)`, das den Kindprozess
+    bei Überschreitung per SIGKILL beendet — ein Betriebssystem-Kill wirkt
+    immer, unabhängig davon, ob die Coroutine kooperativ abbricht. Seither
+    in mehreren Testläufen zu 100% zuverlässig: alle drei BMS liefern in
+    jedem Round-Robin-Zyklus echte Daten, keine Hänger mehr beobachtet.
+- `signalk-beluga-core` (separates, bereits installiertes Plugin) advertised
+  den Laptop selbst als eigenes BLE-Peripheral-Gerät (under the configured device name). Ob/wie stark
+  das den gleichzeitigen Central-Betrieb unseres Plugins auf demselben
+  Adapter stört, ist nicht abschließend geklärt — beim Test mit
+  deaktiviertem beluga-core traten weiterhin Verbindungsfehler auf, aber
+  seltener als davor. Für den späteren Pi-Betrieb ggf. beachten, falls dort
+  ebenfalls ein BLE-Peripheral-Advertiser läuft.
+- node-ble (DBus/BlueZ, wie bleak) wurde für eine reine-Node-Lösung ohne
+  Python-Subprozess evaluiert, aber `device.gatt()` hing dort unbegrenzt
+  ohne jedes Timeout — deutlich unzuverlässiger als bleak. Deshalb bleibt
+  die Architektur bei einem Python/bleak-Subprozess (`ble_worker.py`),
+  gespawnt von `lib/bleWorker.js` nach dem Muster von `signalk-beluga-core`.
+- **Root cause gefunden: nur das ERSTE Gerät im Round-Robin-Zyklus wird
+  zuverlässig per Scan gefunden — unabhängig davon, welches physische
+  Gerät das ist.** Getestet mit zwei verschiedenen Device-Reihenfolgen in
+  `BMS_DEVICES`: in beiden Fällen war exakt das erste Listenelement in
+  praktisch jedem Zyklus erfolgreich, alle nachfolgenden scheiterten
+  konsistent mit `did not advertise within Ns` — trotz `INTER_DEVICE_DELAY_S`-
+  Pause und großzügigem `DISCOVER_TIMEOUT_S=12`. Da jeder Poll-Versuch in
+  einem komplett frischen Subprozess läuft (`poll_once_isolated`, eigener
+  Python-Interpreter, eigener `BleakScanner`), liegt der Effekt nicht am
+  Python/bleak-Zustand, sondern am **BlueZ-Daemon/Adapter-Zustand selbst**:
+  nach einem Scan+Connect+Disconnect-Zyklus scheint der Adapter für eine
+  gewisse Zeit "nachzuhängen" und neue `StartDiscovery`-Aufrufe liefern für
+  andere Geräte keine frischen Advertising-Reports mehr, bis er sich erholt
+  hat (Ursache nicht abschließend geklärt — evtl. BlueZ-interne Discovery-
+  Session-Verwaltung, die sich nicht sauber zwischen kurz aufeinanderfolgenden
+  `StartDiscovery`/`StopDiscovery`-Zyklen zurücksetzt).
+  - Ausprobiert, aber nicht ausreichend: `INTER_DEVICE_DELAY_S=2` Pause
+    zwischen Geräten. Half nicht messbar.
+  - **Umgesetzter Fix**: `start_background_scanner()` startet einen
+    eigenständigen Subprozess, der für die gesamte Worker-Laufzeit EINEN
+    durchgehenden `BleakScanner()`-Scan offen hält (kein Start/Stop pro
+    Gerät mehr). Da BlueZ seinen Geräte-Cache systemweit über DBus teilt
+    (verifiziert: ein von Prozess A gestarteter Scan macht Geräte auch für
+    `bluetoothctl devices` aus einem komplett anderen Prozess sichtbar),
+    genügt das, damit alle konfigurierten Geräte durchgehend im Cache
+    bleiben. Die isolierten `--poll-one`-Subprozesse überspringen dann ihre
+    eigene Discovery-Phase (`BMS_SKIP_DISCOVERY=1`, siehe
+    `SKIP_DISCOVERY_ENV`) und verbinden direkt.
+  - **Zusätzlich gefundene, eigenständige Fehlerquelle**: `BleakClient.connect()`
+    ruft intern selbst nochmal `BleakScanner.find_device_by_address()` auf,
+    komplett unabhängig davon, ob schon ein externer Scan läuft (Quellcode:
+    `bleak/backends/bluezdbus/client.py`, Kommentar "A Discover must have
+    been run before connecting to any devices"). Ein zweites,
+    unzusammenhängendes Problem trat während der Untersuchung auf: das
+    JK-BMS hing über `bluetoothctl info <addr>` als `Connected: yes` fest
+    (Rest einer nicht sauber getrennten Verbindung aus einem abgebrochenen
+    Testlauf) — ein bereits verbundenes BLE-Peripheral stoppt typischerweise
+    sein Advertising, wodurch es für JEDEN Scan unsichtbar wird, unabhängig
+    vom Discovery-Mechanismus. `bluetoothctl disconnect <addr>` (oder ein
+    kompletter `sudo systemctl restart bluetooth`) behebt das. **Nach
+    Bluetooth-Neustart und mit dem Background-Scanner-Fix: 6/6 Zyklen zu
+    100% erfolgreich für alle drei Geräte, keine einzige Fehlermeldung.**
+    Falls künftig wieder ein einzelnes Gerät konsequent scheitert, zuerst
+    `bluetoothctl info <addr>` prüfen, ob es fälschlich als "Connected: yes"
+    geführt wird, bevor an der Protokoll-/Timing-Logik gesucht wird.
+
+## Offene Punkte für die Plugin-Implementierung
+
+1. Entladefall (negativer Strom) beim Daly noch nicht live verifiziert — Vorzeichen-Konvention
+   vor Produktiveinsatz mit tatsächlicher Last gegenprüfen.
+2. JK-BMS Offset=32-Hypothese ist nur mit diesem einen Gerät/dieser Firmware getestet.
+3. Kein Pairing/Bonding nötig war — offene GATT-Verbindung hat für alle drei Geräte gereicht.
+4. BLE-Verbindungen sind auf diesem Laptop-Adapter spürbar unzuverlässiger als bei den
+   isolierten Diagnose-Skript-Läufen — noch unklar, wie viel davon USB-Adapter-/Umgebungs-
+   spezifisch ist und wie viel sich auf dem späteren Pi (ggf. mit Onboard-BT oder anderem
+   Adapter) reproduziert. Vor Produktivbetrieb auf dem Pi erneut beobachten.
