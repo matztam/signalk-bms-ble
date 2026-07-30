@@ -3,3 +3,7 @@ node_modules/
 diag/venv/
 __pycache__/
 *.pyc
+
+# Private deployment notes (specific IPs, hostnames, config of a real
+# boat installation) - not for the public repo.
+diag/findings/private/
