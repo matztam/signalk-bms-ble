@@ -48,7 +48,16 @@ import time
 from bleak import BleakClient, BleakScanner
 
 POLL_INTERVAL_S = 2
-DISCOVER_TIMEOUT_S = 12
+# Increased from an earlier 8s/12s after comparing against the vendor
+# special retry/backoff logic on the Android BLE side - it just waits
+# without an aggressive hard timeout. Advertisement misses right after the
+# scanner restarts (see poll_once: stopped/restarted around every connect
+# to avoid "Operation already in progress") are the main cause of the
+# "did not advertise" errors seen live, not the devices actually being
+# unreachable - a live bluetoothctl scan always found them. More patience
+# here reduces spurious failures without the code complexity of a
+# stop/restart-aware warmup delay.
+DISCOVER_TIMEOUT_S = 20
 CONNECT_TIMEOUT_S = 15
 # Hard ceiling for a single device's poll attempt (discovery + connect +
 # read), enforced by a watchdog thread that os._exit()s the whole process
@@ -337,6 +346,13 @@ async def poll_once(scanner: BleakScanner, device: dict) -> dict:
             return await protocol.read(client)
     finally:
         await scanner.start()
+        # Give BlueZ a moment to actually start receiving advertisements
+        # again before the next device's ensure_discoverable() starts
+        # counting against DISCOVER_TIMEOUT_S - immediately after
+        # StartDiscovery() there's typically a short gap before the first
+        # scan report arrives, which was eating into (and sometimes
+        # exhausting) the next device's discovery window.
+        await asyncio.sleep(0.5)
 
 
 async def round_robin(devices: list, watchdog: Watchdog):
