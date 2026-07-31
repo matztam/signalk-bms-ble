@@ -47,7 +47,7 @@ import time
 
 from bleak import BleakClient, BleakScanner
 
-POLL_INTERVAL_S = 5
+POLL_INTERVAL_S = 2
 DISCOVER_TIMEOUT_S = 12
 CONNECT_TIMEOUT_S = 15
 # Hard ceiling for a single device's poll attempt (discovery + connect +

@@ -19,9 +19,26 @@ module.exports = function (app) {
 
   let bleWorker = null
   let statusText = ''
+  let heartbeatTimer = null
   // Last known reading (or error) per device id, shown live on the plugin
   // config page — see plugin.schema() below.
   const lastReadings = new Map()
+
+  // How often to re-publish the last known good reading even without a
+  // fresh BLE poll. SignalK (and consumers like signalk-to-nmea2000, which
+  // re-sends PGN 127506/127508 on its own resendTime) treat a value as
+  // stale after a while and stop forwarding it - our BLE round-robin only
+  // updates one device every ~15-20s (3 devices, ~5s poll each), and any
+  // single missed/timed-out poll stretches that further. Without this, the
+  // battery data was observed to disappear and reappear on the NMEA2000
+  // bus (Garmin plotter) even though the underlying value hadn't changed.
+  const HEARTBEAT_INTERVAL_MS = 4000
+  // Stop re-publishing a reading once it's this old: a device that's
+  // truly gone (out of range, powered off) should eventually disappear
+  // from the NMEA2000 bus too, rather than us claiming stale numbers are
+  // still current forever. Comfortably above a normal poll cycle (with
+  // some margin for a missed poll or two) but still well under a minute.
+  const MAX_READING_AGE_MS = 45000
 
   function statusIcon (r) {
     if (!r) return '⏳'
@@ -162,6 +179,7 @@ module.exports = function (app) {
       onReading: (msg) => publishReading(msg)
     })
     bleWorker.start()
+    startHeartbeat()
 
     statusText = `Running — polling ${devices.length} device(s): ${devices.map((d) => d.id).join(', ')}`
     if (disabled.length > 0) statusText += ` (${disabled.length} disabled: ${disabled.map((d) => d.id).join(', ')})`
@@ -170,7 +188,8 @@ module.exports = function (app) {
 
   function publishReading (msg) {
     const { id, error } = msg
-    const at = new Date().toLocaleTimeString()
+    const now = Date.now()
+    const at = new Date(now).toLocaleTimeString()
 
     if (error) {
       app.debug(`${id}: ${error}`)
@@ -186,9 +205,14 @@ module.exports = function (app) {
       return
     }
 
-    lastReadings.set(id, { ...msg, at })
+    lastReadings.set(id, { ...msg, at, timestamp: now })
     app.debug(`${id}: ${msg.soc}% SOC, ${msg.packVoltage}V, ${msg.current}A`)
 
+    publishToSignalK(id, msg)
+  }
+
+  function publishToSignalK (id, msg) {
+    const isFiniteNumber = (v) => typeof v === 'number' && Number.isFinite(v)
     const path = `electrical.batteries.${id}`
     const values = [
       // SignalK spec puts state of charge under capacity, not as a
@@ -215,10 +239,26 @@ module.exports = function (app) {
     })
   }
 
+  function startHeartbeat () {
+    heartbeatTimer = setInterval(() => {
+      const now = Date.now()
+      for (const [id, r] of lastReadings.entries()) {
+        if (r.disabled || r.error) continue
+        if (now - r.timestamp > MAX_READING_AGE_MS) continue
+        publishToSignalK(id, r)
+      }
+    }, HEARTBEAT_INTERVAL_MS)
+    if (heartbeatTimer.unref) heartbeatTimer.unref()
+  }
+
   plugin.stop = function () {
     if (bleWorker) {
       bleWorker.stop()
       bleWorker = null
+    }
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer)
+      heartbeatTimer = null
     }
     lastReadings.clear()
     statusText = ''
