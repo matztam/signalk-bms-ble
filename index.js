@@ -108,6 +108,17 @@ module.exports = function (app) {
   }
 
   plugin.start = function (options) {
+    // Guard against a stray double-start leaking a worker process: if
+    // something (SignalK core, a config-save re-trigger, ...) calls
+    // start() again without an intervening stop(), make sure the
+    // previous worker and its Python child are torn down first rather
+    // than orphaning them and losing the reference to stop them later.
+    if (bleWorker) {
+      app.debug('BLE worker: start() called while already running — stopping previous instance first')
+      bleWorker.stop()
+      bleWorker = null
+    }
+
     const allDevices = Array.isArray(options.devices) ? options.devices : []
 
     if (allDevices.length === 0) {
