@@ -70,6 +70,18 @@ RECONNECT_DELAY_S = 5
 # giving up on this connection attempt (it'll be retried).
 DISCOVER_TIMEOUT_S = 20
 CONNECT_TIMEOUT_S = 15
+# Hard outer bound on the whole discover+connect+settle sequence, on top of
+# bleak's own DISCOVER_TIMEOUT_S/CONNECT_TIMEOUT_S. Observed live on the Pi
+# (BlueZ 5.66, not reproduced locally on BlueZ 5.85): bleak's scanner
+# teardown after a timed-out find_device_by_address() talks to BlueZ over
+# DBus with no timeout of its own (BleakScannerBlueZDBus.stop() just awaits
+# StopDiscovery unconditionally) - if that hangs, find_device_by_address()
+# can block far longer than its own `timeout` argument promises, holding
+# connect_lock and starving every other device for minutes. This wraps the
+# whole sequence in an explicit timeout so a stuck attempt is abandoned and
+# connect_lock released for the next device, rather than relying solely on
+# the (much coarser, whole-process-killing) watchdog to eventually notice.
+LOCK_TIMEOUT_S = DISCOVER_TIMEOUT_S + CONNECT_TIMEOUT_S + 15
 # Once connected, how long without a single fresh reading before treating
 # the connection as dead and reconnecting. Generous: some protocols only
 # push new data every few seconds, and BLE notifications are inherently a
@@ -391,26 +403,43 @@ async def run_device(device: dict, watchdog: Watchdog, connect_lock: asyncio.Loc
     device_id = device["id"]
     protocol_cls = PROTOCOLS[device["type"]]
 
+    async def discover_and_connect():
+        async with connect_lock:
+            found = await BleakScanner.find_device_by_address(device["address"], timeout=DISCOVER_TIMEOUT_S)
+            if found is None:
+                raise TimeoutError(f"{device['address']} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
+            client = BleakClient(found, timeout=CONNECT_TIMEOUT_S)
+            await client.connect()
+            # BlueZ sometimes reports the connection as established
+            # before GATT service resolution has actually finished,
+            # causing an immediate start_notify()/write_gatt_char() to
+            # fail with "Service Discovery has not been performed yet".
+            # A short settle delay avoids the race (observed live;
+            # bleak has no built-in wait for "services truly ready").
+            # Kept inside connect_lock along with stream()'s own
+            # setup_lock use: two devices settling/setting up at once
+            # was observed to also collide, not just discover+connect.
+            await asyncio.sleep(1.5)
+            log(f"{device_id} ({device['address']}): connected")
+            return client
+
     while True:
         watchdog.pet(device_id)
         try:
-            async with connect_lock:
-                found = await BleakScanner.find_device_by_address(device["address"], timeout=DISCOVER_TIMEOUT_S)
-                if found is None:
-                    raise TimeoutError(f"{device['address']} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
-                client = BleakClient(found, timeout=CONNECT_TIMEOUT_S)
-                await client.connect()
-                # BlueZ sometimes reports the connection as established
-                # before GATT service resolution has actually finished,
-                # causing an immediate start_notify()/write_gatt_char() to
-                # fail with "Service Discovery has not been performed yet".
-                # A short settle delay avoids the race (observed live;
-                # bleak has no built-in wait for "services truly ready").
-                # Kept inside connect_lock along with stream()'s own
-                # setup_lock use: two devices settling/setting up at once
-                # was observed to also collide, not just discover+connect.
-                await asyncio.sleep(1.5)
-                log(f"{device_id} ({device['address']}): connected")
+            try:
+                # Note: if the timeout lands in the narrow window after a
+                # successful client.connect() but before this returns (the
+                # 1.5s settle sleep), the connection is abandoned without
+                # an explicit disconnect() - accepted tradeoff, since that
+                # window can't itself hang and BlueZ will clean up the
+                # stale connection on its own; not worth the extra
+                # bookkeeping to avoid such a rare, self-healing case.
+                client = await asyncio.wait_for(discover_and_connect(), timeout=LOCK_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"{device['address']}: discover+connect exceeded {LOCK_TIMEOUT_S:.0f}s "
+                    "(BlueZ likely stuck tearing down the scan) - abandoning this attempt"
+                ) from None
 
             try:
                 protocol = protocol_cls()

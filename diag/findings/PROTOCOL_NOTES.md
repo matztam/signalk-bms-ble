@@ -303,3 +303,78 @@ Reichweite (klärt, ob dies das ursprüngliche `daly-1`-Flackern tatsächlich
 behebt), plus Abgleich mit dem Heartbeat-Mechanismus in `index.js` (der für
 den alten Poll-Rhythmus gedacht war und bei durchgehendem Streaming
 möglicherweise seltener/gar nicht mehr nötig ist).
+
+**Update**: Heartbeat-Mechanismus wurde entfernt (siehe Commit) — bei
+Dauerverbindungen kommen echte Messungen alle paar Sekunden von selbst,
+und bei einem echten Verbindungsabbruch soll bewusst keine Ersatzmeldung
+mehr gesendet werden (Nutzerentscheidung).
+
+## `connect_lock` konnte unbegrenzt lange blockiert bleiben — `LOCK_TIMEOUT_S` nachgerüstet (2026-07-31)
+
+Nach Aktivierung aller drei Geräte auf dem Pi 4B: `jk-1` löste nach 20s
+korrekt einen Discovery-Timeout aus und gab den `connect_lock` scheinbar
+frei — aber `daly-1`/`daly-2` blieben danach **~3,5 Minuten** komplett
+still (kein einziger Log-Eintrag, kein Timeout, keine Messung), bevor sich
+der Prozess von selbst erholte. Der `WATCHDOG_TIMEOUT_S=90`-Watchdog hätte
+das eigentlich abfangen müssen, tat es aber nicht.
+
+Lokale Reproduktion (Laptop development laptop, BlueZ 5.85) zeigte zunächst
+keinen Hänger über mehrere Minuten, dann aber — nach Neustart des Tests —
+wiederholt echte, mehrfach reproduzierbare Hänge von einzelnen
+`find_device_by_address()`-Aufrufen weit über ihren eigenen
+`timeout`-Parameter hinaus (in einem Fall >50s statt der übergebenen 15s),
+obwohl ein isolierter `bluetoothctl scan` die Geräte weiterhin sofort fand
+und ein einzelner, isolierter `find_device_by_address()`-Aufruf ohne
+umgebenden Code zuverlässig exakt beim `timeout`-Wert abbrach. Das deutet
+darauf hin, dass der Hänger nicht am Gerät oder am Timeout-Parameter
+selbst liegt, sondern am Scanner-Teardown danach.
+
+**Root Cause identifiziert**: `bleak`s `find_device_by_filter()` (worauf
+`find_device_by_address()` aufbaut) öffnet den Scanner über
+`async with cls(**kwargs) as scanner:` — der eigentliche `timeout`-Parameter
+schützt nur die Warteschleife auf ein passendes Advertisement
+(`async_timeout(timeout)` um die `async for`-Schleife), NICHT das
+Verlassen des `async with`-Blocks. Der Scanner-Teardown
+(`BleakScannerBlueZDBus.stop()`) awaited einen `StopDiscovery`-D-Bus-Call
+komplett ungeschützt, ohne eigenes Timeout. Hängt BlueZ bei der
+Bearbeitung von `StopDiscovery` (beobachtet auf Pi mit BlueZ 5.66,
+reproduziert auch lokal mit BlueZ 5.85 unter dichtem BLE-Umgebungsrauschen
+— viele gleichzeitig sichtbare fremde BLE-Geräte in Log-Auszügen), kann
+`find_device_by_address()` insgesamt beliebig lange blockieren, weit über
+den übergebenen `timeout` hinaus — und da dieser Aufruf innerhalb von
+`connect_lock` liegt, blockiert das dann auch alle anderen Geräte auf
+unbestimmte Zeit.
+
+**Warum der Watchdog das nicht abgefangen hat**: technisch ungeklärt (der
+Watchdog-Mechanismus selbst wurde isoliert getestet und funktioniert
+korrekt, auch gegen einen echten blockierenden Syscall in einem anderen
+Thread — `os._exit()` aus dem Watchdog-Thread beendet den Prozess
+zuverlässig). Denkbar ist ein Zusammenspiel aus Thread-Scheduling unter
+Last und der Tatsache, dass `dbus_fast` (das von `bleak` verwendete, reine
+Python/asyncio-D-Bus-Binding) den blockierten Call technisch als
+awaitbares Future modelliert, das bei Cancellation eigentlich reagieren
+sollte — nicht abschließend geklärt, aber durch den Fix unten ohnehin
+entschärft.
+
+**Fix**: `run_device()` umschließt jetzt die komplette
+discover+connect+settle-Sequenz mit einem expliziten
+`asyncio.wait_for(..., timeout=LOCK_TIMEOUT_S)`
+(`LOCK_TIMEOUT_S = DISCOVER_TIMEOUT_S + CONNECT_TIMEOUT_S + 15`, aktuell
+50s). Läuft dieser äußere Timeout ab, wird der Versuch abgebrochen, der
+`connect_lock` durch das reguläre `async with`-Cancellation-Verhalten
+freigegeben, und der normale Retry-Mechanismus (`RECONNECT_DELAY_S`)
+übernimmt — statt dass ein einzelnes hängendes Gerät alle anderen auf
+unbestimmte Zeit blockiert. Der Watchdog bleibt als letzte
+Absicherungsebene bestehen (falls doch mal etwas hängt, das selbst
+`wait_for`s Cancellation nicht respektiert), ist jetzt aber nicht mehr die
+einzige Verteidigungslinie gegen einen hängenden Scanner-Teardown.
+
+**Live verifiziert (Laptop, dichtes BLE-Umfeld, absichtlich provoziert)**:
+über 120s hielt `daly-1` durchgehend seine Verbindung, während `daly-2`
+mehrfach am 50s-Limit abbrach, erneut versuchte und schließlich erfolgreich
+verband — ohne dass `daly-1` davon jemals beeinträchtigt wurde. Das ist
+strikt besser als vorher: vor dem Fix hätte ein hängendes `daly-2` in
+diesem Szenario potenziell auch `daly-1` für Minuten blockiert.
+
+**Noch offen**: erneuter Pi-4B-Test mit dem Fix, insbesondere ob `daly-1`s
+ursprüngliches Flackern jetzt tatsächlich behoben ist.
