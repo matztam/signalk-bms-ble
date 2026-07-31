@@ -304,74 +304,56 @@ class Watchdog:
                 # is exactly what's not possible if bleak/BlueZ is wedged.
 
 
-async def ensure_discoverable(scanner: BleakScanner, address: str):
-    """Wait for `address` to show up in the shared, already-running
-    scanner's live device list. No per-device start/stop of discovery:
-    that was found to make BlueZ stop reporting fresh advertisements for
-    anyone but the first device polled in a cycle - see
-    diag/findings/PROTOCOL_NOTES.md."""
-    address = address.lower()
-    deadline = asyncio.get_event_loop().time() + DISCOVER_TIMEOUT_S
-    while asyncio.get_event_loop().time() < deadline:
-        for dev in scanner.discovered_devices:
-            if dev.address.lower() == address:
-                return
-        await asyncio.sleep(0.2)
-    raise TimeoutError(f"{address} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
-
-
-async def poll_once(scanner: BleakScanner, device: dict) -> dict:
+async def poll_once(device: dict) -> dict:
     protocol_cls = PROTOCOLS[device["type"]]
     protocol = protocol_cls()
 
-    await ensure_discoverable(scanner, device["address"])
+    # No long-lived background scanner: each poll does its own short,
+    # dedicated discovery scan (find_device_by_address starts and stops
+    # BlueZ discovery internally) immediately followed by connect, then
+    # nothing is scanning while connected. This mirrors how the vendor's
+    # own app behaves (reverse-engineered: no persistent scanner visible
+    # in its Android BLE plugin either) and was found live to have a much
+    # better success rate than keeping one scanner running continuously
+    # and stopping/restarting it around every connect - that approach
+    # left real gaps where a device's advertisement could be missed right
+    # after the scanner restarted, especially noticeable when a device's
+    # advertising interval didn't line up well with our stop/start
+    # timing. See diag/findings/PROTOCOL_NOTES.md for the full history
+    # (including why the *previous* approach of stop/start around a
+    # shared scanner was itself a fix for "Operation already in
+    # progress" - a single dedicated scan-then-connect per poll avoids
+    # that problem too, since nothing else is scanning during connect).
+    found = await BleakScanner.find_device_by_address(device["address"], timeout=DISCOVER_TIMEOUT_S)
+    if found is None:
+        raise TimeoutError(f"{device['address']} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
 
-    # A running discovery session and an active connect attempt both want
-    # exclusive use of the adapter; leaving the scanner going during
-    # connect() reliably produced "org.bluez.Error.InProgress" on every
-    # single attempt (observed live). Stop it for the duration of the
-    # connect+read and resume right after, so devices don't age out of the
-    # scanner's cache between polls (see ensure_discoverable / PROTOCOL_NOTES
-    # for why leaving discovery running otherwise is worth the complexity).
-    await scanner.stop()
-    try:
-        async with BleakClient(device["address"], timeout=CONNECT_TIMEOUT_S) as client:
-            # BlueZ sometimes reports the connection as established before
-            # GATT service resolution has actually finished, causing an
-            # immediate start_notify()/write_gatt_char() to fail with
-            # "Service Discovery has not been performed yet". A short
-            # settle delay avoids the race (observed live; bleak has no
-            # built-in wait for "services truly ready").
-            await asyncio.sleep(1.5)
-            return await protocol.read(client)
-    finally:
-        await scanner.start()
-        # Give BlueZ a moment to actually start receiving advertisements
-        # again before the next device's ensure_discoverable() starts
-        # counting against DISCOVER_TIMEOUT_S - immediately after
-        # StartDiscovery() there's typically a short gap before the first
-        # scan report arrives, which was eating into (and sometimes
-        # exhausting) the next device's discovery window.
-        await asyncio.sleep(0.5)
+    async with BleakClient(found, timeout=CONNECT_TIMEOUT_S) as client:
+        # BlueZ sometimes reports the connection as established before
+        # GATT service resolution has actually finished, causing an
+        # immediate start_notify()/write_gatt_char() to fail with
+        # "Service Discovery has not been performed yet". A short settle
+        # delay avoids the race (observed live; bleak has no built-in
+        # wait for "services truly ready").
+        await asyncio.sleep(1.5)
+        return await protocol.read(client)
 
 
 async def round_robin(devices: list, watchdog: Watchdog):
-    """Poll all configured devices one at a time, forever, in a single
-    long-lived scanner session. A single BLE adapter can only drive one
-    GATT connection attempt at a time, so devices are visited in sequence
-    rather than concurrently."""
-    async with BleakScanner() as scanner:
-        while True:
-            for device in devices:
-                watchdog.pet(device["id"])
-                try:
-                    reading = await poll_once(scanner, device)
-                    emit({"id": device["id"], **reading})
-                except Exception as exc:  # noqa: BLE001 - report and keep going
-                    log(f"{device['id']} ({device['address']}): {exc!r}")
-                    emit({"id": device["id"], "error": str(exc)})
-            watchdog.pet()  # idle between cycles shouldn't count as "stuck"
-            await asyncio.sleep(POLL_INTERVAL_S)
+    """Poll all configured devices one at a time, forever. A single BLE
+    adapter can only drive one GATT connection attempt at a time, so
+    devices are visited in sequence rather than concurrently."""
+    while True:
+        for device in devices:
+            watchdog.pet(device["id"])
+            try:
+                reading = await poll_once(device)
+                emit({"id": device["id"], **reading})
+            except Exception as exc:  # noqa: BLE001 - report and keep going
+                log(f"{device['id']} ({device['address']}): {exc!r}")
+                emit({"id": device["id"], "error": str(exc)})
+        watchdog.pet()  # idle between cycles shouldn't count as "stuck"
+        await asyncio.sleep(POLL_INTERVAL_S)
 
 
 def main():
