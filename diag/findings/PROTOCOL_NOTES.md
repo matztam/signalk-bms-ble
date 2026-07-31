@@ -218,3 +218,88 @@ Wichtige Design-Änderungen beim Umbau:
 **Noch nicht erneut auf dem Pi getestet** — nächster Schritt vor dem nächsten
 Deploy-Versuch: erneut sicherstellen, dass keine andere RAM-hungrige
 Installation (z.B. `pip install`/venv-Builds anderer Plugins) parallel läuft.
+
+## Umbau auf Dauerverbindungen statt Poll/Disconnect-Zyklen (2026-07-31)
+
+Trotz großzügigerer Timeouts (`DISCOVER_TIMEOUT_S=20`) blieb `daly-1` auf dem
+Pi 4B weiterhin intermittierend nicht erreichbar ("did not advertise"),
+während ein einfaches `bluetoothctl scan` das Gerät zuverlässig fand und die
+Hersteller-App sich jedes Mal "einwandfrei" verband. Die Android-App wurde
+BLE-Brücke): die Java/Kotlin-Schicht (Scan-Callback, GATT-Callback,
+Method-Channel-Setup) enthält keinerlei besondere Retry-/Backoff-Logik — nur
+Standard-Android-BLE-Aufrufe. Die eigentliche App-Logik liegt in
+struktureller Unterschied war schon an der Java-Brücke sichtbar: die App
+verbindet sich einmal und bleibt verbunden, statt wie unser bisheriger
+Poll-Ansatz für jede Messung neu zu scannen und neu zu verbinden.
+
+**Hypothese**: nicht die Geräte selbst sind unzuverlässig, sondern das
+wiederholte Discovery+Connect pro Poll-Zyklus ist die eigentliche
+Fehlerquelle (verpasste Advertisement-Fenster bei jedem neuen Scan-Versuch).
+
+Ein isolierter Test (`test_persistent_connections.py`, nicht Teil des
+Plugins) bestätigte zusätzlich, dass ein einzelner BLE-Adapter durchaus
+**mehrere gleichzeitig offene** GATT-Verbindungen halten kann — die
+"nur eine Operation gleichzeitig"-Grenze von BlueZ/DBus betrifft nur das
+**Herstellen** einer Verbindung (Scan+Connect), nicht das **Halten**
+mehrerer bereits offener Verbindungen. Beide Daly-Geräte liefen 60+s
+gleichzeitig verbunden mit 12/12 Messungen, 0 Fehlern.
+
+**Umbau**: `ble_worker.py` verbindet sich jetzt pro Gerät genau einmal und
+bleibt verbunden, statt für jede Messung neu zu scannen/verbinden/trennen:
+
+- `Protocol.stream(client, on_reading, setup_lock)` ersetzt das alte
+  `Protocol.read(client)`. Abonniert einmalig die Notify-Characteristic,
+  schickt die initiale(n) Anfrage(n) (`request()`/`extra_requests()`, siehe
+  oben), und lässt danach den Notify-Handler laufend `on_reading()` für
+  jeden neuen Frame aufrufen, bis der Aufrufer abbricht (Verbindung verloren
+  o.ä.).
+- **Wichtiger Protokoll-Unterschied entdeckt**: JK02 "pusht" nach der
+  initialen Anfrage von selbst weiter (free-running) — bestätigt live über
+  90s durchgehend, 112 Messungen ohne einen einzigen erneuten Request nötig.
+  Daly (D2-Dialekt) dagegen beantwortet eine Anfrage genau einmal und
+  schweigt dann wieder — braucht periodisches erneutes `write_gatt_char()`
+  (`request_interval_s = 5`, übernommen aus dem erfolgreichen Testskript),
+  sonst bleiben nach der ersten Antwort keine weiteren Daten mehr.
+- `run_device()` pro Gerät ist eine Endlosschleife: verbinden → `stream()`
+  aufrufen (blockiert, bis Verbindung abbricht) → bei jedem Fehler/Abbruch
+  `RECONNECT_DELAY_S=5s` warten und von vorn beginnen. Ein Geräteausfall
+  betrifft nur dieses Gerät, nicht die anderen.
+- `run_all()` startet für jedes Gerät einen eigenen `asyncio`-Task und hält
+  sie alle parallel offen (`asyncio.gather`).
+- **Zweite Race Condition gefunden und gefixt, die im Testskript (nur ein
+  einmaliger Connect ohne Reconnects während der Laufzeit) nicht sichtbar
+  war**: sobald zwei Geräte fast gleichzeitig verbinden bzw. neu verbinden
+  (z.B. nach einem Reconnect mitten im Betrieb), kollidieren nicht nur
+  Discovery+Connect (`org.bluez.Error.InProgress`), sondern auch das direkt
+  anschließende GATT-Setup (`start_notify`/erste `write_gatt_char`-Anfrage)
+  mit `BleakGATTProtocolErrorCode.UNLIKELY_ERROR` ("GATT Protocol Error:
+  Unlikely Error"). Fix: ein einziges, geteiltes `asyncio.Lock`
+  (`connect_lock`) serialisiert nicht nur Discovery+Connect, sondern auch
+  den Settle-Delay und das gesamte initiale GATT-Setup bis zur ersten
+  erfolgreichen Messung — für jeden Verbindungsversuch, nicht nur beim
+  Start. Das Lock wird freigegeben, sobald ein Gerät nur noch passiv lauscht
+  bzw. im Daly-Fall periodisch nachfragt; das läuft dann uneingeschränkt
+  parallel zu den anderen Geräten.
+- Watchdog: statt eines globalen "Rundenende"-Zeitstempels (ergab in einem
+  Dauerverbindungsmodell keinen Sinn mehr, da es keine Runden mehr gibt)
+  führt `Watchdog._last_pet` jetzt pro Geräte-ID einen eigenen Zeitstempel;
+  `pet(device_id)` wird bei jedem Connect-Versuch und bei jeder empfangenen
+  Messung aufgerufen. Bleibt irgendein Gerät zu lange ohne Fortschritt,
+  beendet sich der gesamte Prozess weiterhin komplett (`os._exit(1)`) — ein
+  einzelnes hängendes Gerät deutet eher auf einen verklemmten
+  Adapter/DBus-Zustand hin als auf ein isoliertes Geräteproblem.
+
+**Live verifiziert (Laptop development laptop, vor Pi-Deployment)**:
+- Beide Daly-Geräte gleichzeitig, 75s, 0 Fehler, durchgehend frische Daten
+  (Request-Intervall 5s eingehalten).
+- Alle drei Geräte gleichzeitig (JK-1 in Reichweite, beide Daly außer
+  Reichweite von der Testposition): JK-1 lieferte 112 fehlerfreie Messungen
+  über 90s am Stück, während die außer Reichweite befindlichen Daly-Geräte
+  alle 5s einen Reconnect-Versuch unternahmen (erwartungsgemäß scheiternd)
+  — ohne dass dies die bereits laufende JK-1-Verbindung jemals gestört hätte.
+
+**Noch offen**: erneuter Pi-4B-Deploy-Test mit allen drei Geräten in
+Reichweite (klärt, ob dies das ursprüngliche `daly-1`-Flackern tatsächlich
+behebt), plus Abgleich mit dem Heartbeat-Mechanismus in `index.js` (der für
+den alten Poll-Rhythmus gedacht war und bei durchgehendem Streaming
+möglicherweise seltener/gar nicht mehr nötig ist).

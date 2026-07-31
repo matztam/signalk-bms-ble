@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
 """
-BLE polling worker for the signalk-bms-ble plugin.
+BLE worker for the signalk-bms-ble plugin.
 
 Connects to any number of BMS over Bluetooth LE (via bleak / BlueZ-DBus,
 same stack used during protocol diagnosis — avoids the HCI-socket conflicts
-noble/HCI-raw approaches have with a running bluetoothd), polls each in turn
-(a single BLE adapter can't run multiple GATT connection attempts at once —
-concurrent connects fail with "Operation already in progress"), and prints
-one JSON object per line to stdout for every successful reading. All logging
-goes to stderr so stdout stays clean newline-delimited JSON for the parent
-Node process.
+noble/HCI-raw approaches have with a running bluetoothd) and holds one
+persistent connection per device for the worker's whole lifetime, printing
+one JSON object per line to stdout for every fresh reading pushed by the
+device's own BLE notifications. All logging goes to stderr so stdout stays
+clean newline-delimited JSON for the parent Node process.
 
-Single long-lived process (one BleakScanner, one asyncio event loop, for the
-worker's whole lifetime) rather than a subprocess per poll attempt — a
-previous per-poll-subprocess design was too heavy for a memory-constrained
-Raspberry Pi (416MB RAM), where several concurrent Python interpreters
-pushed the system into swapping and made SignalK itself unresponsive. See
+Why persistent connections instead of poll/disconnect cycles: an earlier
+design reconnected on every poll (discover -> connect -> read -> disconnect,
+repeated every couple of seconds). That repeated discovery was found live to
+be the main source of intermittent "did not advertise" failures - a device
+could work fine for many cycles and then fail for several in a row, even
+though a plain `bluetoothctl scan` always found it and the vendor's own app
+it just connects once and stays connected, same as this. A quick live
+experiment confirmed a single adapter can hold multiple simultaneous BMS
+connections open (the "only one GATT operation at a time" limit turned out
+to apply to *establishing* connections, not to *holding* several already-
+open ones) - so each device gets its own long-lived asyncio task that
+connects once (serialized against the others to avoid "Operation already in
+progress" during the connect itself), subscribes to notifications, and just
+keeps listening. A device that drops reconnects on its own without
+affecting the others.
+
+Single long-lived process (one asyncio event loop for the worker's whole
+lifetime) rather than a subprocess per poll attempt — a previous per-poll-
+subprocess design was too heavy for a memory-constrained Raspberry Pi
+(416MB RAM), where several concurrent Python interpreters pushed the system
+into swapping and made SignalK itself unresponsive. See
 diag/findings/PROTOCOL_NOTES.md for that investigation. The tradeoff: a rare
 BlueZ/DBus hang (observed once, see WATCHDOG_TIMEOUT_S) can no longer be
 isolated to a throwaway subprocess, so a watchdog thread hard-exits this
-whole process if a poll attempt doesn't return in time; the parent
+whole process if no device has made progress in too long; the parent
 (lib/bleWorker.js) already auto-restarts a dead worker, so this just costs
 one reconnect cycle instead of hanging forever.
 
@@ -28,9 +43,10 @@ are never hardcoded: a JSON array like
   [{"id": "house-1", "type": "jk", "address": "11:22:33:44:55:66"},
    {"id": "daly-1", "type": "daly", "address": "11:22:33:44:55:67"}]
 
-Adding a new BMS brand/protocol: subclass Protocol below, implement
-async read(client) -> dict, and add an entry to PROTOCOLS. No other code
-needs to change; the "type" field in BMS_DEVICES then selects it.
+Adding a new BMS brand/protocol: subclass Protocol below, implement feed()
+to turn raw notification bytes into a reading dict, and add an entry to
+PROTOCOLS. No other code needs to change; the "type" field in BMS_DEVICES
+then selects it.
 
 Output line shape:
   {"id": "...", "packVoltage": 13.4, "current": 18.9, "soc": 56.1,
@@ -47,24 +63,27 @@ import time
 
 from bleak import BleakClient, BleakScanner
 
-POLL_INTERVAL_S = 2
-# Increased from an earlier 8s/12s after comparing against the vendor
-# special retry/backoff logic on the Android BLE side - it just waits
-# without an aggressive hard timeout. Advertisement misses right after the
-# scanner restarts (see poll_once: stopped/restarted around every connect
-# to avoid "Operation already in progress") are the main cause of the
-# "did not advertise" errors seen live, not the devices actually being
-# unreachable - a live bluetoothctl scan always found them. More patience
-# here reduces spurious failures without the code complexity of a
-# stop/restart-aware warmup delay.
+# Time to wait between reconnect attempts for a device that dropped or
+# never connected in the first place.
+RECONNECT_DELAY_S = 5
+# How long to wait for a device to show up in a discovery scan before
+# giving up on this connection attempt (it'll be retried).
 DISCOVER_TIMEOUT_S = 20
 CONNECT_TIMEOUT_S = 15
-# Hard ceiling for a single device's poll attempt (discovery + connect +
-# read), enforced by a watchdog thread that os._exit()s the whole process
-# if exceeded - see module docstring for why a plain asyncio timeout is not
-# trusted to be enough on its own (BlueZ/DBus can leave a coroutine blocked
-# in a kernel wait that asyncio's cooperative cancellation can't interrupt).
-WATCHDOG_TIMEOUT_S = DISCOVER_TIMEOUT_S + CONNECT_TIMEOUT_S + 10
+# Once connected, how long without a single fresh reading before treating
+# the connection as dead and reconnecting. Generous: some protocols only
+# push new data every few seconds, and BLE notifications are inherently a
+# bit bursty.
+STALE_CONNECTION_S = 60
+# Hard ceiling on any one device going without progress (whether waiting to
+# connect or waiting on an already-open connection) before the watchdog
+# thread hard-exits the whole process - see module docstring for why a
+# plain asyncio timeout is not trusted to be enough on its own (BlueZ/DBus
+# can leave a coroutine blocked in a kernel wait that asyncio's cooperative
+# cancellation can't interrupt). Set comfortably above the largest
+# individual timeout above so a single slow-but-working device doesn't
+# trigger it.
+WATCHDOG_TIMEOUT_S = max(DISCOVER_TIMEOUT_S + CONNECT_TIMEOUT_S, STALE_CONNECTION_S) + 30
 
 
 def log(msg):
@@ -96,34 +115,73 @@ class Protocol:
         only yields settings/device-info frames. Override if needed."""
         return []
 
+    #: Seconds between repeated request() writes while connected. Some BMS
+    #: (observed on Daly D2) only answer a request once and go silent
+    #: afterwards rather than pushing fresh frames on their own - unlike
+    #: JK02, which keeps pushing 0x02 cell-info frames unprompted once
+    #: nudged via extra_requests(). Override to None for protocols that do
+    #: free-run so we don't write to the device needlessly.
+    request_interval_s = None
+
     def feed(self, chunk: bytes):
         """Feed one notification's raw bytes. Return a parsed reading dict
         once a complete, validated frame has been assembled, else None."""
         raise NotImplementedError
 
-    async def read(self, client: BleakClient) -> dict:
+    async def stream(self, client: BleakClient, on_reading, setup_lock: asyncio.Lock):
+        """Subscribe to notifications and keep calling on_reading(dict) for
+        every complete, validated frame received, for as long as the caller
+        awaits this coroutine (typically until the connection drops or is
+        cancelled). Sends the initial request, then extra_requests() as
+        needed to get the device to start pushing data - see
+        extra_requests() docstring - but once readings are flowing this
+        just listens; the device keeps pushing on its own.
+
+        setup_lock serializes GATT setup (start_notify + the initial
+        request(s), up to the first reading) across devices - observed
+        live: two devices reaching this point on the same adapter at
+        almost the same moment can make write_gatt_char() fail with a GATT
+        "Unlikely Error", not just the discover+connect step. Held only
+        until the first reading (or a timeout) so it doesn't block other
+        devices' setup once this one is just idly listening/re-requesting."""
         write_char = self.write_char or self.notify_char
-        loop = asyncio.get_event_loop()
-        result = loop.create_future()
+        got_first_reading = asyncio.Event()
 
         def handler(_sender, data: bytearray):
-            if result.done():
-                return
             reading = self.feed(bytes(data))
             if reading is not None:
-                result.set_result(reading)
+                got_first_reading.set()
+                on_reading(reading)
 
-        await client.start_notify(self.notify_char, handler)
+        async with setup_lock:
+            await client.start_notify(self.notify_char, handler)
+            try:
+                await client.write_gatt_char(write_char, self.request(), response=False)
+                for extra in self.extra_requests():
+                    try:
+                        await asyncio.wait_for(got_first_reading.wait(), timeout=1.5)
+                        break  # already got a reading, no need to send more nudges
+                    except asyncio.TimeoutError:
+                        pass
+                    await client.write_gatt_char(write_char, extra, response=False)
+                await asyncio.wait_for(got_first_reading.wait(), timeout=CONNECT_TIMEOUT_S)
+            except BaseException:
+                await client.stop_notify(self.notify_char)
+                raise
         try:
-            await client.write_gatt_char(write_char, self.request(), response=False)
-            for extra in self.extra_requests():
-                try:
-                    await asyncio.wait_for(asyncio.shield(result), timeout=1.5)
-                    break  # already got a reading, no need to send more nudges
-                except asyncio.TimeoutError:
-                    pass
-                await client.write_gatt_char(write_char, extra, response=False)
-            return await asyncio.wait_for(result, timeout=CONNECT_TIMEOUT_S)
+            if self.request_interval_s is None:
+                # Free-running: the device keeps pushing frames on its own,
+                # just stay connected and let the notify handler keep
+                # firing on_reading() until the caller cancels us (e.g.
+                # because the connection dropped).
+                await asyncio.Event().wait()
+            else:
+                # This protocol only answers once per request and then
+                # goes quiet - keep re-requesting periodically for as long
+                # as we're connected.
+                while True:
+                    await asyncio.sleep(self.request_interval_s)
+                    await client.write_gatt_char(write_char, self.request(), response=False)
         finally:
             await client.stop_notify(self.notify_char)
 
@@ -215,6 +273,9 @@ class DalyProtocol(Protocol):
     write_char = "0000fff2-0000-1000-8000-00805f9b34fb"
 
     CURRENT_OFFSET = 30000
+    # Confirmed live: Daly answers each 0xD2 0x03 request once and then
+    # goes quiet - it does not free-run like JK02 does.
+    request_interval_s = 5
 
     @staticmethod
     def _crc16_modbus(data: bytes) -> int:
@@ -270,21 +331,24 @@ PROTOCOLS = {
 
 
 class Watchdog:
-    """Pets itself before/after every poll attempt; a background thread
-    checks whether it's been fed recently and hard-exits the process if
-    not. This is the only reliable way found to escape a BlueZ/DBus call
+    """Each device task pets its own key regularly (on connect attempts,
+    reconnects, and every reading); a background thread checks whether any
+    of them has gone quiet for too long and hard-exits the whole process if
+    so. This is the only reliable way found to escape a BlueZ/DBus call
     that never returns and doesn't respond to asyncio cancellation (see
-    module docstring) without paying for a subprocess per poll."""
+    module docstring) without paying for a subprocess per device. A single
+    process-wide exit (rather than per-device recovery) is deliberate: a
+    device that's stuck long enough to trip this is more likely a wedged
+    adapter/DBus connection than a per-device problem, and restarting the
+    whole worker resets that shared state for everyone."""
 
     def __init__(self, timeout_s: float):
         self._timeout_s = timeout_s
-        self._last_pet = time.monotonic()
-        self._current_device = None
+        self._last_pet = {}
         self._stop = False
 
-    def pet(self, device_id=None):
-        self._last_pet = time.monotonic()
-        self._current_device = device_id
+    def pet(self, device_id: str):
+        self._last_pet[device_id] = time.monotonic()
 
     def stop(self):
         self._stop = True
@@ -292,68 +356,91 @@ class Watchdog:
     def run(self):
         while not self._stop:
             time.sleep(1)
-            if time.monotonic() - self._last_pet > self._timeout_s:
-                log(
-                    f"watchdog: no progress for {self._timeout_s:.0f}s "
-                    f"(stuck on {self._current_device!r}) - exiting so the "
-                    "supervisor can restart us"
-                )
-                sys.stderr.flush()
-                sys.stdout.flush()
-                os._exit(1)  # deliberately skips cleanup - a clean shutdown
-                # is exactly what's not possible if bleak/BlueZ is wedged.
+            now = time.monotonic()
+            for device_id, last_pet in self._last_pet.items():
+                if now - last_pet > self._timeout_s:
+                    log(
+                        f"watchdog: no progress for {self._timeout_s:.0f}s "
+                        f"(stuck on {device_id!r}) - exiting so the "
+                        "supervisor can restart us"
+                    )
+                    sys.stderr.flush()
+                    sys.stdout.flush()
+                    os._exit(1)  # deliberately skips cleanup - a clean
+                    # shutdown is exactly what's not possible if
+                    # bleak/BlueZ is wedged.
 
 
-async def poll_once(device: dict) -> dict:
+async def run_device(device: dict, watchdog: Watchdog, connect_lock: asyncio.Lock):
+    """Hold a single persistent connection to one device, forever. Discovery
+    only happens once per connection attempt (not once per reading) - this
+    is the whole point of the persistent-connection architecture: repeated
+    discovery was the actual source of intermittent "did not advertise"
+    failures, not the devices themselves being flaky (confirmed live: the
+    vendor app, which also connects once and stays connected, never had
+    this problem; see diag/findings/PROTOCOL_NOTES.md). On any disconnect
+    or error, wait RECONNECT_DELAY_S and reconnect from scratch.
+
+    connect_lock serializes the discover+connect phase across all devices -
+    not just at startup but for the lifetime of the process, since any
+    device can independently drop and reconnect at any time. Without this,
+    a reconnect on one device can race a reconnect (or the initial connect)
+    on another and both fail with "Operation already in progress" - BlueZ
+    only supports one discovery/connect operation in flight at a time, but
+    holding an already-open connection doesn't need the lock at all."""
+    device_id = device["id"]
     protocol_cls = PROTOCOLS[device["type"]]
-    protocol = protocol_cls()
 
-    # No long-lived background scanner: each poll does its own short,
-    # dedicated discovery scan (find_device_by_address starts and stops
-    # BlueZ discovery internally) immediately followed by connect, then
-    # nothing is scanning while connected. This mirrors how the vendor's
-    # own app behaves (reverse-engineered: no persistent scanner visible
-    # in its Android BLE plugin either) and was found live to have a much
-    # better success rate than keeping one scanner running continuously
-    # and stopping/restarting it around every connect - that approach
-    # left real gaps where a device's advertisement could be missed right
-    # after the scanner restarted, especially noticeable when a device's
-    # advertising interval didn't line up well with our stop/start
-    # timing. See diag/findings/PROTOCOL_NOTES.md for the full history
-    # (including why the *previous* approach of stop/start around a
-    # shared scanner was itself a fix for "Operation already in
-    # progress" - a single dedicated scan-then-connect per poll avoids
-    # that problem too, since nothing else is scanning during connect).
-    found = await BleakScanner.find_device_by_address(device["address"], timeout=DISCOVER_TIMEOUT_S)
-    if found is None:
-        raise TimeoutError(f"{device['address']} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
-
-    async with BleakClient(found, timeout=CONNECT_TIMEOUT_S) as client:
-        # BlueZ sometimes reports the connection as established before
-        # GATT service resolution has actually finished, causing an
-        # immediate start_notify()/write_gatt_char() to fail with
-        # "Service Discovery has not been performed yet". A short settle
-        # delay avoids the race (observed live; bleak has no built-in
-        # wait for "services truly ready").
-        await asyncio.sleep(1.5)
-        return await protocol.read(client)
-
-
-async def round_robin(devices: list, watchdog: Watchdog):
-    """Poll all configured devices one at a time, forever. A single BLE
-    adapter can only drive one GATT connection attempt at a time, so
-    devices are visited in sequence rather than concurrently."""
     while True:
-        for device in devices:
-            watchdog.pet(device["id"])
+        watchdog.pet(device_id)
+        try:
+            async with connect_lock:
+                found = await BleakScanner.find_device_by_address(device["address"], timeout=DISCOVER_TIMEOUT_S)
+                if found is None:
+                    raise TimeoutError(f"{device['address']} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
+                client = BleakClient(found, timeout=CONNECT_TIMEOUT_S)
+                await client.connect()
+                # BlueZ sometimes reports the connection as established
+                # before GATT service resolution has actually finished,
+                # causing an immediate start_notify()/write_gatt_char() to
+                # fail with "Service Discovery has not been performed yet".
+                # A short settle delay avoids the race (observed live;
+                # bleak has no built-in wait for "services truly ready").
+                # Kept inside connect_lock along with stream()'s own
+                # setup_lock use: two devices settling/setting up at once
+                # was observed to also collide, not just discover+connect.
+                await asyncio.sleep(1.5)
+                log(f"{device_id} ({device['address']}): connected")
+
             try:
-                reading = await poll_once(device)
-                emit({"id": device["id"], **reading})
-            except Exception as exc:  # noqa: BLE001 - report and keep going
-                log(f"{device['id']} ({device['address']}): {exc!r}")
-                emit({"id": device["id"], "error": str(exc)})
-        watchdog.pet()  # idle between cycles shouldn't count as "stuck"
-        await asyncio.sleep(POLL_INTERVAL_S)
+                protocol = protocol_cls()
+
+                def on_reading(reading: dict):
+                    watchdog.pet(device_id)
+                    emit({"id": device_id, **reading})
+
+                await protocol.stream(client, on_reading, connect_lock)
+            finally:
+                await client.disconnect()
+        except Exception as exc:  # noqa: BLE001 - report and keep retrying
+            log(f"{device_id} ({device['address']}): {exc!r}")
+            emit({"id": device_id, "error": str(exc)})
+
+        log(f"{device_id}: disconnected, reconnecting in {RECONNECT_DELAY_S}s")
+        await asyncio.sleep(RECONNECT_DELAY_S)
+
+
+async def run_all(devices: list, watchdog: Watchdog):
+    """Launch one persistent-connection task per device, sharing a single
+    connect_lock so discovery+connect (whether the initial one or any later
+    reconnect) is always serialized across devices - BlueZ only supports
+    one such operation in flight at a time. Once a device is connected,
+    holding its connection open runs fully in parallel with the others.
+    Proven live: two simultaneous persistent connections held open for 60+s
+    with zero errors, see diag/findings/PROTOCOL_NOTES.md."""
+    connect_lock = asyncio.Lock()
+    tasks = [asyncio.create_task(run_device(device, watchdog, connect_lock)) for device in devices]
+    await asyncio.gather(*tasks)
 
 
 def main():
@@ -372,8 +459,8 @@ def main():
     watchdog = Watchdog(WATCHDOG_TIMEOUT_S)
     threading.Thread(target=watchdog.run, daemon=True).start()
 
-    log(f"Starting round-robin polling for {len(devices)} device(s), interval={POLL_INTERVAL_S}s")
-    asyncio.run(round_robin(devices, watchdog))
+    log(f"Starting persistent connections for {len(devices)} device(s)")
+    asyncio.run(run_all(devices, watchdog))
 
 
 if __name__ == "__main__":
