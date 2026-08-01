@@ -23,6 +23,19 @@ module.exports = function (app) {
   // config page — see plugin.schema() below.
   const lastReadings = new Map()
 
+  // Smoothed current per device id, used only for capacity.timeRemaining
+  // (see publishToSignalK below) - the raw instantaneous current is noisy
+  // (compressor cycling, brief load spikes), which would otherwise make
+  // the reported time-to-empty jump around on every reading even though
+  // the underlying situation barely changed. Time-constant exponential
+  // moving average rather than a fixed-size window average, since
+  // readings arrive at very different rates per protocol (JK free-runs
+  // multiple times a second, Daly only every ~5s) - this keeps the
+  // effective averaging window in wall-clock time regardless of reading
+  // rate.
+  const smoothedCurrent = new Map()
+  const CURRENT_SMOOTHING_TAU_S = 45
+
   function statusIcon (r) {
     if (!r) return '⏳'
     if (r.disabled) return '⏸'
@@ -193,6 +206,24 @@ module.exports = function (app) {
     publishToSignalK(id, msg)
   }
 
+  // Updates and returns the smoothed current for a device. Time-constant
+  // EMA: alpha = 1 - exp(-dt/tau), so the effective averaging window
+  // stays ~CURRENT_SMOOTHING_TAU_S regardless of how often readings
+  // arrive for this particular device/protocol.
+  function smoothCurrent (id, current) {
+    const now = Date.now()
+    const prev = smoothedCurrent.get(id)
+    if (!prev) {
+      smoothedCurrent.set(id, { value: current, at: now })
+      return current
+    }
+    const dt = (now - prev.at) / 1000
+    const alpha = 1 - Math.exp(-dt / CURRENT_SMOOTHING_TAU_S)
+    const value = prev.value + alpha * (current - prev.value)
+    smoothedCurrent.set(id, { value, at: now })
+    return value
+  }
+
   function publishToSignalK (id, msg) {
     const isFiniteNumber = (v) => typeof v === 'number' && Number.isFinite(v)
     const path = `electrical.batteries.${id}`
@@ -225,8 +256,9 @@ module.exports = function (app) {
 
         // Only meaningful while discharging (current < 0, per SignalK's
         // sign convention) - charging or idle has no "time until empty".
-        if (isFiniteNumber(msg.current) && msg.current < 0) {
-          const timeRemainingS = (remainingAh / -msg.current) * 3600
+        const avgCurrent = isFiniteNumber(msg.current) ? smoothCurrent(id, msg.current) : undefined
+        if (isFiniteNumber(avgCurrent) && avgCurrent < 0) {
+          const timeRemainingS = (remainingAh / -avgCurrent) * 3600
           values.push({ path: `${path}.capacity.timeRemaining`, value: timeRemainingS })
         }
       }
@@ -248,6 +280,7 @@ module.exports = function (app) {
       bleWorker = null
     }
     lastReadings.clear()
+    smoothedCurrent.clear()
     statusText = ''
     app.setPluginStatus('Stopped')
   }
