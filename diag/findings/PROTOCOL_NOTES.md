@@ -378,3 +378,55 @@ diesem Szenario potenziell auch `daly-1` für Minuten blockiert.
 
 **Noch offen**: erneuter Pi-4B-Test mit dem Fix, insbesondere ob `daly-1`s
 ursprüngliches Flackern jetzt tatsächlich behoben ist.
+
+**Update nach Live-Beobachtung auf dem Pi 4B**: über ~75 Minuten zeigte
+sich ein wiederkehrendes Muster aus längeren stabilen Phasen (20-25+
+Minuten fehlerfrei) unterbrochen von kürzeren rauen Phasen (5-6 Minuten,
+u.a. direkt nach einem Reboot), in denen der Onboard-BLE-Chip
+(Broadcom BCM4345C0, per UART angebunden) Discovery-Probleme hat. Das
+System erholt sich in jedem Fall von selbst, ohne dass ein Gerät das
+andere dauerhaft blockiert und ohne dass SignalKs HTTP-Antwortzeit je
+beeinträchtigt wurde. Entscheidung: erstmal so weiterlaufen lassen statt
+in einen USB-BLE-Dongle zu investieren; der Fix begrenzt den Schaden
+zuverlässig genug.
+
+## Nennkapazität (Ah) aus beiden Protokollen ausgelesen, für `capacity.actual`/`.remaining`/`.timeRemaining` (2026-08-01)
+
+Anlass: der Garmin-Plotter zeigt neben SOC/Spannung/Strom einen
+Zeit-Platzhalter an (vermutlich `capacity.timeRemaining` aus PGN 127506),
+den wir bisher nicht befüllt haben. Beide BMS-Typen melden ihre aktuelle
+volle Ladekapazität (nicht die feste Werks-Nennkapazität — der Wert drfitet
+mit Zellalterung/-kalibrierung) bereits im ohnehin abgefragten Antwortframe
+mit, wir haben sie bisher nur nicht ausgelesen:
+
+- **Daly (D2-Dialekt)**: Register `0x30`, ×0.1 Ah. Live gegen beide
+  Geräte verifiziert: 279.4 Ah (daly-1) und 280.0 Ah (daly-2), passend zu
+  den verbauten 280Ah-Zellen. Die leichte Abweichung zwischen den beiden
+  sonst baugleichen Geräten bestätigt, dass es der aktuelle Ist-Wert ist,
+  nicht ein fester Konstantenwert im Protokoll.
+- **JK-BMS (JK02)**: im Cell-Info-Frame (`0x02`) bei Offset `146 +
+  FIELD_OFFSET` (also `178` mit unserem verifizierten `FIELD_OFFSET=32`),
+  u32 × 0.001 Ah — vom `esphome-jk-bms`-Projekt intern als
+  `full_charge_capacity_sensor_` bezeichnet, obwohl der Feldname im
+  Protokoll `Nominal_Capacity` lautet. Cross-verifiziert gegen eine
+  zweite, unabhängige Fundstelle im Settings-Frame (`0x01`, Offset `130`,
+  ohne FIELD_OFFSET) — beide liefern übereinstimmend 105.000 Ah, passend
+  zur tatsächlich verbauten JK-Bank (andere/kleinere Zellen als bei den
+  Dalys).
+
+`ble_worker.py` liefert das jetzt als `fullChargeCapacityAh` im Reading
+zusätzlich zu den bisherigen Feldern. `index.js` rechnet daraus (Ah → Wh
+via ×packVoltage → J via ×3600, da SignalKs `capacity.*`-Felder in Joule
+sind):
+- `capacity.actual` = fullChargeCapacityAh × packVoltage × 3600
+- `capacity.remaining` = (soc/100 × fullChargeCapacityAh) × packVoltage × 3600
+- `capacity.timeRemaining` = (soc/100 × fullChargeCapacityAh) / |current| × 3600,
+  nur bei `current < 0` (Entladung, SignalK-Vorzeichenkonvention) — bei
+  Ladung oder Ruhestrom gibt es keine sinnvolle "Zeit bis leer".
+
+Live-verifiziert (Laptop, alle drei Geräte): korrekte Werte in allen drei
+Readings, plausible Hochrechnung (z.B. 279Ah bei 99.8% SOC und
+hypothetischen 20A Entladestrom → ~13.9h, exakt wie erwartet).
+
+**Noch offen**: Deploy auf den Pi 4B und Sichtprüfung im Garmin-Plotter,
+ob der bisherige Zeit-Platzhalter jetzt einen Wert anzeigt.

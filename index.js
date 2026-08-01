@@ -211,6 +211,27 @@ module.exports = function (app) {
       })
     }
 
+    // BMS-reported current full-charge capacity (not a fixed nameplate
+    // value - drifts with cell aging/calibration, read live from each
+    // device; see ble_worker.py). SignalK's capacity.actual/remaining are
+    // in joules, so convert Ah -> Wh (x packVoltage) -> J (x3600).
+    if (isFiniteNumber(msg.fullChargeCapacityAh) && isFiniteNumber(msg.packVoltage)) {
+      const actualJ = msg.fullChargeCapacityAh * msg.packVoltage * 3600
+      values.push({ path: `${path}.capacity.actual`, value: actualJ })
+
+      if (isFiniteNumber(msg.soc)) {
+        const remainingAh = (msg.soc / 100) * msg.fullChargeCapacityAh
+        values.push({ path: `${path}.capacity.remaining`, value: remainingAh * msg.packVoltage * 3600 })
+
+        // Only meaningful while discharging (current < 0, per SignalK's
+        // sign convention) - charging or idle has no "time until empty".
+        if (isFiniteNumber(msg.current) && msg.current < 0) {
+          const timeRemainingS = (remainingAh / -msg.current) * 3600
+          values.push({ path: `${path}.capacity.timeRemaining`, value: timeRemainingS })
+        }
+      }
+    }
+
     app.handleMessage(plugin.id, {
       updates: [
         {

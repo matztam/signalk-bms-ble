@@ -274,6 +274,16 @@ class JkProtocol(Protocol):
             "packVoltage": u32(118 + off) / 1000,
             "current": i32(126 + off) / 1000,
             "soc": frame[141 + off],
+            # esphome-jk-bms calls this field "full_charge_capacity" (its
+            # sensor name) despite the JK02 field being labeled
+            # Nominal_Capacity in most protocol notes - it's the BMS's own
+            # current calibrated full-charge capacity (drifts with cell
+            # aging/calibration), not a fixed factory nameplate value.
+            # Offset 146 relative to the same FIELD_OFFSET-shifted base
+            # used above, u32 x 0.001 Ah. Cross-checked against the 0x01
+            # settings frame's "Nominal battery capacity" field (offset
+            # 130, unshifted) - both agree (105.000 Ah on this hardware).
+            "fullChargeCapacityAh": u32(146 + off) / 1000,
         }
 
 
@@ -331,6 +341,12 @@ class DalyProtocol(Protocol):
             "packVoltage": reg(0x28) / 10,
             "current": (reg(0x29) - self.CURRENT_OFFSET) / 10,
             "soc": reg(0x2A) / 10,
+            # Register 0x30, x0.1 Ah. Confirmed live on both units here
+            # (279.4 and 280.0 Ah on nominally-280Ah cells) - reads as the
+            # BMS's own current full-charge capacity, not a fixed nameplate
+            # constant (the two units differ slightly), consistent with
+            # JkProtocol's fullChargeCapacityAh below.
+            "fullChargeCapacityAh": reg(0x30) / 10,
         }
 
 
