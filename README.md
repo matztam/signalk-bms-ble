@@ -88,6 +88,26 @@ Pro konfiguriertem Gerät unter `electrical.batteries.<id>.*`:
 `capacity.timeRemaining` ist z.B. das, was ein NMEA2000-Plotter (PGN 127506)
 als "Zeit bis leer" neben SOC/Spannung/Strom anzeigt.
 
+## Statusseite
+
+`/signalk-bms-ble/` (gleicher Host/Port wie der SignalK-Server, z.B.
+`http://192.168.1.100/signalk-bms-ble/`) zeigt eine für Handys optimierte
+HTML-Seite mit den aktuellen Werten aller Geräte, die Zellspannungen melden
+(SOC-Balken, Spannung, Strom, Kapazität, Restlaufzeit, Zellspannungen),
+aktualisiert sich alle 10s selbst. Erscheint auch als "BMS Status" in
+SignalKs eigener Webapp-Übersicht (App-Dock o.ä.).
+
+Technisch eine statische Seite unter `public/index.html`, per
+`signalk-webapp`-Keyword in `package.json` von SignalK automatisch unter
+`/<package-name>/` gemountet (derselbe Mechanismus wie bei z.B.
+`@signalk/freeboard-sk` oder `@signalk/app-dock`) — dieser Mountpunkt liegt
+außerhalb des Admin-Logins, den SignalK für `/plugins/*` erzwingt. Die Seite
+selbst holt ihre Daten im Browser per JS von der öffentlichen
+SignalK-REST-API (`/signalk/v1/api/vessels/self/electrical/batteries`, per
+`tokensecurity` explizit unauthentifiziert lesbar), rendert also rein
+client-seitig ohne eigenen Server-Endpoint im Plugin. Ein Link auf die
+Statusseite steht auch oben auf der Plugin-Config-Seite.
+
 ## Bekannte Geräte (dieses Boot-Setup)
 
 | id | Typ | Adresse | Anzeigename | Kapazität |

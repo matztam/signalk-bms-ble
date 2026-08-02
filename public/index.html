@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BMS Status</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f2f3f5;
+    --card-bg: #ffffff;
+    --text: #1a1c1e;
+    --sub: #6b7280;
+    --border: #e5e7eb;
+    --ok: #22c55e;
+    --mid: #f59e0b;
+    --low: #ef4444;
+    --error-bg: #fef2f2;
+    --error-text: #991b1b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --card-bg: #1a1d23;
+      --text: #f0f1f3;
+      --sub: #9aa1ac;
+      --border: #2a2e37;
+      --error-bg: #2a1414;
+      --error-text: #fca5a5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 480px;
+    margin-inline: auto;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 4px 4px 16px;
+  }
+  header h1 { font-size: 1.1rem; margin: 0; }
+  header .time { font-size: 0.8rem; color: var(--sub); }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 12px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .card.muted { opacity: 0.6; }
+  .card.error { background: var(--error-bg); color: var(--error-text); border-color: transparent; }
+  .card h2 {
+    font-size: 1rem;
+    margin: 0 0 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .status-dot.ok { background: var(--ok); }
+  .status-dot.stale { background: var(--mid); }
+  .sub { color: var(--sub); font-size: 0.9rem; margin: 0; }
+  .at { color: var(--sub); font-size: 0.75rem; margin: 12px 0 0; }
+  .soc-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .soc-bar {
+    flex: 1;
+    height: 10px;
+    background: var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .soc-fill { height: 100%; border-radius: 6px; }
+  .soc-fill.ok { background: var(--ok); }
+  .soc-fill.mid { background: var(--mid); }
+  .soc-fill.low { background: var(--low); }
+  .soc-num { font-size: 1.1rem; font-weight: 600; min-width: 3.2em; text-align: right; }
+  .metrics {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .metric {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .metric .label { font-size: 0.72rem; color: var(--sub); text-transform: uppercase; letter-spacing: 0.04em; }
+  .metric .value { font-size: 1.05rem; font-weight: 600; }
+  .cells {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
+    gap: 6px;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .cell {
+    font-size: 0.8rem;
+    color: var(--sub);
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .cell .cell-n {
+    font-size: 0.68rem;
+    color: var(--sub);
+    opacity: 0.7;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔋 BMS Status</h1>
+  <span class="time" id="time"></span>
+</header>
+<div id="cards"><p class="sub" style="padding:0 4px">Lade…</p></div>
+
+<script>
+  const REFRESH_MS = 10000
+  // A reading older than this is shown with a "stale" indicator instead of
+  // "ok" - the SignalK path can still hold a last-known value long after
+  // the BMS itself stopped reporting (BLE disconnect, plugin restart, ...).
+  const STALE_AFTER_MS = 30000
+
+  function escapeHtml (s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+  }
+
+  function formatTime (date) {
+    return date.toLocaleTimeString('de-DE', { hour12: false })
+  }
+
+  function formatDuration (seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return null
+    const h = Math.floor(seconds / 3600)
+    const m = Math.round((seconds % 3600) / 60)
+    if (h === 0) return `${m} min`
+    return `${h} h ${m} min`
+  }
+
+  function renderCard (id, battery) {
+    const title = escapeHtml(id)
+    const soc = battery?.capacity?.stateOfCharge?.value
+    const voltage = battery?.voltage?.value
+    const current = battery?.current?.value
+    const timestamps = ['capacity.stateOfCharge', 'voltage', 'current']
+      .map((p) => p.split('.').reduce((o, k) => o?.[k], battery)?.timestamp)
+      .filter(Boolean)
+    const latest = timestamps.length > 0 ? new Date(Math.max(...timestamps.map((t) => new Date(t)))) : null
+
+    if (!Number.isFinite(soc) || !Number.isFinite(voltage) || !Number.isFinite(current)) {
+      return `<section class="card muted">
+        <h2>${title}</h2>
+        <p class="sub">unvollständige Daten</p>
+      </section>`
+    }
+
+    const ageMs = latest ? Date.now() - latest.getTime() : Infinity
+    const stale = ageMs > STALE_AFTER_MS
+    const socPct = soc * 100
+    const socClass = socPct <= 20 ? 'low' : socPct <= 50 ? 'mid' : 'ok'
+
+    const actualJ = battery?.capacity?.actual?.value
+    const timeRemainingS = battery?.capacity?.timeRemaining?.value
+    const hasCapacity = Number.isFinite(actualJ) && Number.isFinite(voltage) && voltage > 0
+    const capacityAhValue = hasCapacity ? actualJ / voltage / 3600 : null
+    const timeRemainingText = Number.isFinite(timeRemainingS) ? formatDuration(timeRemainingS) : null
+
+    const cellVoltages = battery?.cellVoltages && typeof battery.cellVoltages === 'object'
+      ? Object.entries(battery.cellVoltages)
+        .map(([n, c]) => [Number(n), c?.voltage?.value])
+        .filter(([, v]) => Number.isFinite(v))
+        .sort((a, b) => a[0] - b[0])
+      : []
+    const cells = cellVoltages.length > 0
+      ? `<div class="cells">${cellVoltages.map(([n, v]) => `<div class="cell"><span class="cell-n">${n}</span>${v.toFixed(3)} V</div>`).join('')}</div>`
+      : ''
+
+    return `<section class="card">
+      <h2>${title} <span class="status-dot ${stale ? 'stale' : 'ok'}" aria-hidden="true"></span></h2>
+      <div class="soc-row">
+        <div class="soc-bar"><div class="soc-fill ${socClass}" style="width:${Math.max(0, Math.min(100, socPct))}%"></div></div>
+        <div class="soc-num">${socPct.toFixed(0)}%</div>
+      </div>
+      <div class="metrics">
+        <div class="metric"><span class="label">Spannung</span><span class="value">${voltage.toFixed(2)} V</span></div>
+        <div class="metric"><span class="label">Strom</span><span class="value">${current.toFixed(2)} A</span></div>
+        ${hasCapacity
+          ? `<div class="metric"><span class="label">Kapazität</span><span class="value">${capacityAhValue.toFixed(1)} Ah</span></div>
+             <div class="metric"><span class="label">Restlaufzeit</span><span class="value">${timeRemainingText || '—'}</span></div>`
+          : ''}
+      </div>
+      ${cells}
+      <p class="at">Letztes Update: ${latest ? formatTime(latest) : '?'}</p>
+    </section>`
+  }
+
+  async function refresh () {
+    document.getElementById('time').textContent = formatTime(new Date())
+    try {
+      const res = await fetch('/signalk/v1/api/vessels/self/electrical/batteries', { cache: 'no-store' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const batteries = await res.json()
+
+      // Only our own BMS units report cell voltages - the boat's other
+      // electrical.batteries.* entries (e.g. an NMEA2000 device reporting
+      // only pack voltage) are not ours to show here. Sorted explicitly -
+      // object key order here follows whichever device last updated, not
+      // a stable/alphabetical order.
+      const ids = Object.keys(batteries)
+        .filter((id) => batteries[id]?.cellVoltages)
+        .sort((a, b) => a.localeCompare(b, 'de', { numeric: true }))
+
+      const container = document.getElementById('cards')
+      if (ids.length === 0) {
+        container.innerHTML = '<p class="sub" style="padding:0 4px">Keine BMS-Geräte gefunden.</p>'
+        return
+      }
+      container.innerHTML = ids.map((id) => renderCard(id, batteries[id])).join('\n')
+    } catch (err) {
+      document.getElementById('cards').innerHTML =
+        `<section class="card error"><h2>Fehler</h2><p class="sub">${escapeHtml(err.message)}</p></section>`
+    }
+  }
+
+  refresh()
+  setInterval(refresh, REFRESH_MS)
+</script>
+</body>
+</html>

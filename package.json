@@ -5,7 +5,8 @@
   "main": "index.js",
   "keywords": [
     "signalk-node-server-plugin",
-    "signalk-category-battery"
+    "signalk-category-battery",
+    "signalk-webapp"
   ],
   "dependencies": {},
   "engines": {
@@ -13,6 +14,10 @@
   },
   "license": "AGPL-3.0-only",
   "author": "",
+  "signalk": {
+    "displayName": "BMS Status",
+    "appIcon": "./icon.svg"
+  },
   "repository": {
     "type": "git",
     "url": "github:matztam/signalk-bms-ble"

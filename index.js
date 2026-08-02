@@ -36,6 +36,10 @@ module.exports = function (app) {
   const smoothedCurrent = new Map()
   const CURRENT_SMOOTHING_TAU_S = 45
 
+  function formatTime (ms) {
+    return new Date(ms).toLocaleTimeString('de-DE', { hour12: false })
+  }
+
   function statusIcon (r) {
     if (!r) return '⏳'
     if (r.disabled) return '⏸'
@@ -67,6 +71,10 @@ module.exports = function (app) {
       _liveSummary: {
         type: 'null',
         title: `Live status: ${summary}`
+      },
+      _statusPageLink: {
+        type: 'null',
+        title: `Mobile-friendly status page: /${plugin.id}/`
       }
     }
 
@@ -160,7 +168,7 @@ module.exports = function (app) {
     const disabled = allDevices.filter((d) => d.enabled === false)
     lastReadings.clear()
     for (const d of disabled) {
-      lastReadings.set(d.id, { disabled: true, at: new Date().toLocaleTimeString() })
+      lastReadings.set(d.id, { disabled: true, at: formatTime(Date.now()) })
     }
 
     if (devices.length === 0) {
@@ -184,7 +192,7 @@ module.exports = function (app) {
   function publishReading (msg) {
     const { id, error } = msg
     const now = Date.now()
-    const at = new Date(now).toLocaleTimeString()
+    const at = formatTime(now)
 
     if (error) {
       app.debug(`${id}: ${error}`)
