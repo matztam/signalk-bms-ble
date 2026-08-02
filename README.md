@@ -1,161 +1,225 @@
 # signalk-bms-ble
 
-SignalK-Plugin, das SOC, Spannung, Strom, Zellspannungen und Restkapazität
-von JK-BMS und Daly Smart BMS Geräten über Bluetooth LE ausliest und unter
-`electrical.batteries.<id>.*` veröffentlicht.
+SignalK plugin that reads state of charge, voltage, current, cell voltages
+and capacity from JK-BMS and Daly Smart BMS battery management systems over
+Bluetooth LE, and publishes them under `electrical.batteries.<id>.*`.
 
-## Architektur
+## Supported hardware
 
-- `ble_worker.py` — **ein einziger langlebiger** Python-Prozess (via
-  `bleak`/BlueZ-DBus). Jedes konfigurierte BMS bekommt einen eigenen
-  `asyncio`-Task, der sich **einmal verbindet und dauerhaft verbunden
-  bleibt** (kein Poll/Disconnect-Zyklus) und laufend Messwerte über BLE-
-  Notifications empfängt. Discovery+Connect-Versuche werden über ein
-  geteiltes `asyncio.Lock` zwischen allen Geräten serialisiert (BlueZ
-  erlaubt nur einen solchen Vorgang gleichzeitig), außerdem durch ein
-  äußeres Timeout (`LOCK_TIMEOUT_S`) begrenzt, damit ein einzelnes
-  hängendes Gerät nicht alle anderen blockiert. Ein Watchdog-Thread
-  beendet den ganzen Prozess hart, falls trotzdem etwas über
-  `WATCHDOG_TIMEOUT_S` hinaus hängen bleibt. Ergebnisse gehen zeilenweise
-  als JSON auf stdout. Läuft in einer eigenen venv (`.venv/`, wird beim
-  ersten Plugin-Start automatisch angelegt). Details und die
-  Entscheidungsgeschichte (u.a. warum Dauerverbindungen statt Poll-Zyklen)
-  stehen in `diag/findings/PROTOCOL_NOTES.md`.
-- `lib/bleWorker.js` — spawnt/überwacht den Python-Prozess, parst dessen
-  JSON-Zeilen, startet ihn bei Absturz automatisch neu.
-- `index.js` — SignalK-Plugin-Entry-Point: Konfigurations-Schema
-  (Geräteliste, pro Gerät ein-/ausschaltbar), wandelt Readings in
-  SignalK-Deltas um (inkl. Umrechnung der vom BMS gemeldeten Ah-Kapazität
-  in SignalKs Joule-basierte `capacity.actual`/`.remaining`/
-  `.timeRemaining`, mit geglättetem Strom für die Restlaufzeit-Berechnung),
-  zeigt die letzten Werte live auf der Plugin-Config-Seite an.
+- **JK-BMS**, JK02 protocol family (BLE UART passthrough, service `0xFFE0`).
+  Verified against JK-B2A8S20P hardware.
+- **Daly Smart BMS**, D2 dialect (Modbus-RTU-style framing over BLE, service
+  `0xFFF0`). Verified against BMS-ST103-303E hardware.
 
-**Warum ein Python-Prozess statt eines reinen Node-BLE-Moduls?**
-`@abandonware/noble` braucht meist exklusiven HCI-Zugriff und kollidiert mit
-laufendem `bluetoothd`. `node-ble` (DBus/BlueZ, wie bleak) wurde getestet,
-hing aber beim Connect unbegrenzt fest, ohne eigenes Timeout. `bleak` ist die
-einzige Bibliothek, die sich gegen die reale Hardware als zuverlässig
-herausgestellt hat — siehe `diag/findings/PROTOCOL_NOTES.md`.
+Both protocols have variants across firmware/board generations that use
+different byte offsets for the same fields (see
+`diag/findings/PROTOCOL_NOTES.md`). The plugin validates every parsed
+reading against physically sane ranges (SOC 0-100%, voltage, current) and
+drops + reports readings that fail this check instead of silently
+publishing wrong numbers — if your device reports "implausible reading" in
+the SignalK log, please open a GitHub issue with your BMS model/firmware so
+support for that variant can be added.
 
-**Warum Dauerverbindungen statt Poll/Disconnect-Zyklen?**
-Ein früherer Ansatz verband sich für jede Messung neu (Discover → Connect →
-Lesen → Trennen). Wiederholtes Discovery erwies sich live als Hauptquelle
-intermittierender "did not advertise"-Fehler — ein Gerät konnte über viele
-Zyklen hinweg zuverlässig funktionieren und dann mehrfach hintereinander
-scheitern, obwohl ein einfaches `bluetoothctl scan` es immer fand und die
-Hersteller-App sich jedes Mal einwandfrei verband (bestätigt durch
-verbunden). Ein Live-Experiment bestätigte außerdem, dass ein einzelner
-BLE-Adapter mehrere gleichzeitig offene Verbindungen halten kann — die
-"nur eine Operation gleichzeitig"-Grenze von BlueZ betrifft nur das
-*Herstellen*, nicht das *Halten* von Verbindungen. Details in
+## Requirements
+
+- SignalK server, Node.js >= 18.
+- **Linux with BlueZ.** Developed and tested on Raspberry Pi OS / Debian
+  with BlueZ 5.66-5.85. The Python BLE library used here (`bleak`) also has
+  macOS (CoreBluetooth) and Windows (WinRT) backends, so those platforms may
+  work, but this plugin's connection retry/timeout/watchdog logic was
+  written against BlueZ-specific behavior and hasn't been exercised there.
+- **Python 3** with the standard `venv` module. On Debian/Ubuntu/Raspberry
+  Pi OS this is a separate package from the base `python3` install:
+  ```
+  sudo apt install python3-venv
+  ```
+  Without it, the plugin's first-run virtual environment setup fails with
+  an `ensurepip is not available` error.
+- Internet access on first plugin start (to `pip install bleak` into the
+  plugin's own virtual environment, created automatically under `.venv/`).
+- **Bluetooth permissions.** SignalK typically runs as a non-root user. On
+  most distros that user needs to be in the `bluetooth` group (or have
+  equivalent BlueZ D-Bus policy permissions) to use Bluetooth LE at all:
+  ```
+  sudo usermod -aG bluetooth <signalk-user>
+  ```
+  then log the user out/in (or reboot) for the group change to take
+  effect. Without this, connections typically fail with a permission or
+  D-Bus access error.
+
+## Installation
+
+```
+cd ~/.signalk
+npm install signalk-bms-ble
+```
+
+Restart signalk-server, then enable the plugin under **Server → Plugin
+Config** and add your devices to the device list (see "Finding your
+device's Bluetooth address" below).
+
+## Configuration
+
+Each entry in the device list needs:
+
+| Field | Meaning |
+|---|---|
+| `id` | SignalK battery instance id, used as `electrical.batteries.<id>.*` — must be unique across devices, e.g. `house1` |
+| `type` | `jk` or `daly` |
+| `address` | Bluetooth MAC address of the BMS, e.g. `11:22:33:44:55:66` |
+| `enabled` | Uncheck to stop polling a device without deleting its config |
+
+### Finding your device's Bluetooth address
+
+The plugin does not auto-discover devices — with multiple BMS of the same
+brand this is ambiguous by service UUID alone, and you'd risk pointing an
+`id` at the wrong physical battery. Instead, find the address with the
+diagnostic scripts in `diag/` (own virtualenv under `diag/venv/`, see
+`diag/README.md`):
+
+```
+cd diag
+python3 -m venv venv && venv/bin/pip install bleak
+venv/bin/python scan.py
+```
+
+This lists nearby BLE devices; match yours by name (JK/Daly units usually
+advertise a manufacturer-ish name) or by process of elimination (power one
+battery off/on and see which entry appears/disappears).
+
+## Published SignalK paths
+
+Per configured device, under `electrical.batteries.<id>.*`:
+
+| Path | Meaning | Condition |
+|---|---|---|
+| `capacity.stateOfCharge` | SOC, 0-1 (SignalK convention) | always |
+| `voltage` | Pack voltage in V | always |
+| `current` | Current in A (negative = discharging) | always |
+| `cellVoltages.<n>.voltage` | Individual cell voltages | always |
+| `capacity.actual` | Current full-charge capacity in J (BMS-reported Ah × voltage × 3600 — not a fixed nameplate value, drifts with cell aging/calibration) | when the BMS reports a capacity |
+| `capacity.remaining` | Remaining capacity in J (SOC × `capacity.actual`) | same as above |
+| `capacity.timeRemaining` | Time to empty in s | same as above, only while discharging (`current < 0`); uses a smoothed current (~45s time constant) so brief load spikes don't make the value jump around |
+
+`capacity.timeRemaining` is what an NMEA2000 plotter (PGN 127506) shows as
+"time remaining" next to SOC/voltage/current.
+
+## Status page
+
+`/signalk-bms-ble/` (same host/port as the SignalK server, e.g.
+`http://<signalk-host>/signalk-bms-ble/`) shows a mobile-friendly HTML page
+with live values for every device reporting cell voltages (SOC bar,
+voltage, current, capacity, time remaining, cell voltages), refreshing
+itself every 10s. Also listed as "BMS Status" in SignalK's own webapp
+overview (App Dock etc.).
+
+Technically a static page under `public/index.html`, mounted automatically
+by SignalK under `/<package-name>/` via the `signalk-webapp` keyword in
+`package.json` (the same mechanism used by e.g. `@signalk/freeboard-sk` or
+`@signalk/app-dock`) — this mount point sits outside the admin login
+SignalK enforces on `/plugins/*`. The page fetches its data client-side
+from the standard, unauthenticated SignalK REST API
+(`/signalk/v1/api/vessels/self/electrical/batteries`), so there's no
+server-side rendering code in the plugin itself.
+
+## Architecture
+
+- `ble_worker.py` — **a single long-lived** Python process (via
+  `bleak`/BlueZ-DBus). Each configured BMS gets its own `asyncio` task that
+  **connects once and stays connected** (no poll/disconnect cycle),
+  continuously receiving readings via BLE notifications. Discovery+connect
+  attempts are serialized across all devices via a shared `asyncio.Lock`
+  (BlueZ only allows one such operation at a time), bounded by an outer
+  timeout (`LOCK_TIMEOUT_S`) so one stuck device can't block the others. A
+  watchdog thread hard-exits the whole process if something still hangs
+  past `WATCHDOG_TIMEOUT_S`. Results go to stdout as newline-delimited
+  JSON. Runs in its own virtual environment (`.venv/`, created
+  automatically on first plugin start). See `diag/findings/PROTOCOL_NOTES.md`
+  for the decision history (including why persistent connections instead of
+  poll cycles).
+- `lib/bleWorker.js` — spawns/supervises the Python process, parses its
+  JSON lines, restarts it automatically on crash.
+- `index.js` — SignalK plugin entry point: config schema (device list,
+  per-device enable/disable), converts readings into SignalK deltas
+  (including converting the BMS-reported Ah capacity into SignalK's
+  joule-based `capacity.actual`/`.remaining`/`.timeRemaining`, using a
+  smoothed current for the time-remaining calculation), shows live values
+  on the plugin config page.
+
+**Why a Python process instead of a pure Node BLE module?**
+`@abandonware/noble` typically needs exclusive HCI access and conflicts
+with a running `bluetoothd`. `node-ble` (DBus/BlueZ, like bleak) was
+tested but hung indefinitely on connect, with no timeout of its own.
+`bleak` is the only library that proved reliable against the real
+hardware — see `diag/findings/PROTOCOL_NOTES.md`.
+
+**Why persistent connections instead of poll/disconnect cycles?**
+An earlier approach reconnected for every reading (discover → connect →
+read → disconnect). Repeated discovery turned out live to be the main
+source of intermittent "did not advertise" failures — a device could work
+reliably for many cycles and then fail several times in a row, even though
+a plain `bluetoothctl scan` always found it. A live experiment also
+confirmed that a single BLE adapter can hold several simultaneously open
+connections — BlueZ's "only one operation at a time" limit applies only to
+*establishing* connections, not to *holding* them open. Details in
 `diag/findings/PROTOCOL_NOTES.md`.
 
-## Neues BMS-Fabrikat hinzufügen
+## Adding a new BMS brand
 
-1. In `ble_worker.py`: eine neue `Protocol`-Subklasse schreiben (siehe
-   `JkProtocol`/`DalyProtocol` als Vorlage) — `notify_char`, `write_char`,
-   `request()`, `feed()` implementieren; optional `extra_requests()` (falls
-   das Gerät erst nach einer zweiten Anfrage Live-Daten pusht) und
-   `request_interval_s` (falls das Gerät nicht von selbst weiter pusht,
-   sondern periodisch erneut angefragt werden muss — siehe DalyProtocol).
-   In `PROTOCOLS` registrieren.
-2. In `index.js`: den neuen Typ-Key + Anzeigename in `KNOWN_TYPES` ergänzen.
+1. In `ble_worker.py`: write a new `Protocol` subclass (see
+   `JkProtocol`/`DalyProtocol` as templates) — implement `notify_char`,
+   `write_char`, `request()`, `feed()`; optionally `extra_requests()` (if
+   the device only starts pushing live data after a second request) and
+   `request_interval_s` (if the device doesn't keep pushing on its own and
+   needs periodic re-requesting — see `DalyProtocol`). Register it in
+   `PROTOCOLS`.
+2. In `index.js`: add the new type key + display name to `KNOWN_TYPES`.
 
-Kein anderer Code muss angefasst werden — die Geräteliste in der Plugin-Config
-bleibt MAC-Adress-basiert und typ-agnostisch.
+No other code needs to change — the device list in the plugin config stays
+MAC-address-based and type-agnostic.
 
-## Diagnose-Skripte
+## Diagnostic scripts
 
-`diag/` enthält die Skripte, mit denen die Protokolle ursprünglich
-reverse-engineered wurden (`scan.py`, `inspect_gatt.py`, `probe.py`, eigene
-venv unter `diag/venv/`). Nützlich, um ein neues/unbekanntes BMS-Modell zu
-untersuchen, bevor man eine neue `Protocol`-Klasse schreibt.
+`diag/` contains the scripts originally used to reverse-engineer the BMS
+protocols (`scan.py`, `inspect_gatt.py`, `probe.py`, own virtualenv under
+`diag/venv/`). Useful for investigating a new/unknown BMS model before
+writing a new `Protocol` class, or for finding a device's Bluetooth
+address (see "Finding your device's Bluetooth address" above).
 
-## Veröffentlichte SignalK-Pfade
+## Known limitations
 
-Pro konfiguriertem Gerät unter `electrical.batteries.<id>.*`:
+- The discharge case (negative current) for the Daly protocol has so far
+  only been verified against the register formula, not cross-checked
+  against a real discharge load.
+- No pairing/bonding needed; an open GATT connection is enough. Only one
+  connection per BMS at a time — the vendor's own phone app must not be
+  connected at the same time as the plugin.
+- On Raspberry Pi hardware with onboard BLE (e.g. Pi 4B, Broadcom chip via
+  UART rather than USB), occasional multi-minute rough phases have been
+  observed (BlueZ takes unusually long for discovery/scanner teardown),
+  typically shortly after a reboot. The system has recovered on its own in
+  every observed case; `LOCK_TIMEOUT_S` prevents an affected device from
+  blocking the others while this happens. This has not been observed on
+  USB Bluetooth adapters. Details in `diag/findings/PROTOCOL_NOTES.md`.
+- **On very low-RAM hardware** (e.g. a Raspberry Pi with 512MB or less),
+  check free RAM before installing (`free -h`) and avoid installing/starting
+  this plugin at the same time as other RAM-heavy setup work — an earlier
+  per-poll-subprocess design (since replaced by the single persistent
+  process described above) pushed a 416MB Pi into swapping badly enough to
+  make SignalK itself unresponsive. See `diag/findings/PROTOCOL_NOTES.md`.
 
-| Pfad | Bedeutung | Voraussetzung |
-|---|---|---|
-| `capacity.stateOfCharge` | SOC, 0–1 (SignalK-Konvention) | immer |
-| `voltage` | Packspannung in V | immer |
-| `current` | Strom in A (negativ = Entladung) | immer |
-| `cellVoltages.<n>.voltage` | Einzelzellspannungen | immer |
-| `capacity.actual` | Aktuelle volle Ladekapazität in J (vom BMS gemeldete Ah × Spannung × 3600 — kein fester Werks-Nennwert, driftet mit Zellalterung/-kalibrierung) | wenn das BMS eine Kapazität meldet |
-| `capacity.remaining` | Verbleibende Kapazität in J (SOC × `capacity.actual`) | wie oben |
-| `capacity.timeRemaining` | Restlaufzeit bis leer in s | wie oben, nur während Entladung (`current < 0`); Berechnung nutzt einen geglätteten Strom (Zeitkonstante ~45s), damit kurze Lastspitzen den Wert nicht springen lassen |
+## Example: a real 3-battery setup
 
-`capacity.timeRemaining` ist z.B. das, was ein NMEA2000-Plotter (PGN 127506)
-als "Zeit bis leer" neben SOC/Spannung/Strom anzeigt.
+For reference, this is what the device list looks like on the boat this
+plugin was originally built for — three BMS with the capacities they
+themselves report (not derived from any model number):
 
-## Statusseite
-
-`/signalk-bms-ble/` (gleicher Host/Port wie der SignalK-Server, z.B.
-`http://192.168.1.100/signalk-bms-ble/`) zeigt eine für Handys optimierte
-HTML-Seite mit den aktuellen Werten aller Geräte, die Zellspannungen melden
-(SOC-Balken, Spannung, Strom, Kapazität, Restlaufzeit, Zellspannungen),
-aktualisiert sich alle 10s selbst. Erscheint auch als "BMS Status" in
-SignalKs eigener Webapp-Übersicht (App-Dock o.ä.).
-
-Technisch eine statische Seite unter `public/index.html`, per
-`signalk-webapp`-Keyword in `package.json` von SignalK automatisch unter
-`/<package-name>/` gemountet (derselbe Mechanismus wie bei z.B.
-`@signalk/freeboard-sk` oder `@signalk/app-dock`) — dieser Mountpunkt liegt
-außerhalb des Admin-Logins, den SignalK für `/plugins/*` erzwingt. Die Seite
-selbst holt ihre Daten im Browser per JS von der öffentlichen
-SignalK-REST-API (`/signalk/v1/api/vessels/self/electrical/batteries`, per
-`tokensecurity` explizit unauthentifiziert lesbar), rendert also rein
-client-seitig ohne eigenen Server-Endpoint im Plugin. Ein Link auf die
-Statusseite steht auch oben auf der Plugin-Config-Seite.
-
-## Bekannte Geräte (dieses Boot-Setup)
-
-| id | Typ | Adresse | Anzeigename | Kapazität |
+| id | type | address | display name | capacity |
 |---|---|---|---|---|
 | jk-1 | jk | 11:22:33:44:55:66 | Example-BMS | ~105 Ah |
 | daly-1 | daly | 11:22:33:44:55:67 | DL-EXAMPLE1 | ~280 Ah |
 | daly-2 | daly | 11:22:33:44:55:68 | DL-EXAMPLE2 | ~280 Ah |
 
-Alle drei sind elektrisch 4S-Packs (nicht 8S, trotz JK-Modellbezeichnung
-"B2A8S20P" — siehe PROTOCOL_NOTES.md für Details). Die Kapazitätsangaben
-sind die vom jeweiligen BMS selbst gemeldeten, aktuellen Werte (siehe oben),
-nicht aus der Modellbezeichnung abgeleitet.
+## License
 
-## Bekannte Einschränkungen / offene Punkte
-
-- Entladefall (negativer Strom) beim Daly-Protokoll ist bisher nur anhand der
-  Registerformel verifiziert, nicht mit echter Entladelast gegengetestet.
-- Kein Pairing/Bonding nötig; eine offene GATT-Verbindung reicht für alle
-  drei Geräte. Nur eine Verbindung pro BMS gleichzeitig möglich — die
-  Original-Handy-Apps dürfen während des Plugin-Betriebs nicht gleichzeitig
-  verbunden sein.
-- Auf Raspberry-Pi-Hardware mit onboard-BLE (z.B. Pi 4B, Broadcom-Chip per
-  UART statt USB) wurden gelegentliche, mehrminütige raue Phasen
-  beobachtet (BlueZ braucht ungewöhnlich lange für Discovery/Scanner-
-  Teardown), typischerweise kurz nach einem Neustart. Das System erholt
-  sich in jedem beobachteten Fall selbstständig; `LOCK_TIMEOUT_S` verhindert,
-  dass ein betroffenes Gerät dabei die anderen blockiert. Details in
-  PROTOCOL_NOTES.md.
-- **Erster Deployment-Versuch auf einem Raspberry Pi mit nur 416MB RAM
-  scheiterte**: ein damaliger Subprozess-pro-Poll-Ansatz (mehrere gleichzeitig
-  laufende Python-Interpreter) brachte den Pi zum Swappen und SignalK
-  reagierte gar nicht mehr — Details in PROTOCOL_NOTES.md. Deshalb der
-  Umbau auf einen einzigen Dauerprozess mit persistenten Verbindungen. Bei
-  RAM-armer Hardware trotzdem Vorsicht geboten: RAM-Headroom vor dem Deploy
-  prüfen (`free -h`), und nicht gleichzeitig mit anderen RAM-hungrigen
-  Setup-Vorgängen (z.B. Erstinstallation anderer Plugins) deployen.
-
-## Lokale Installation (SignalK auf diesem Rechner)
-
-```
-ln -s /home/matthias/projekte/signalk-bms-plugin ~/.signalk/node_modules/signalk-bms-ble
-```
-
-und in `~/.signalk/package.json` unter `dependencies` ergänzen:
-
-```json
-"signalk-bms-ble": "file:../projekte/signalk-bms-plugin"
-```
-
-Danach signalk-server (neu) starten, Plugin unter Server → Plugin Config
-aktivieren und die Geräteliste eintragen.
+AGPL-3.0-only, see `LICENSE`.

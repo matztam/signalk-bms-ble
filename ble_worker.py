@@ -140,6 +140,38 @@ class Protocol:
         once a complete, validated frame has been assembled, else None."""
         raise NotImplementedError
 
+
+# Sanity bounds applied to every parsed reading regardless of protocol,
+# before it's published. These exist because a checksum-valid frame can
+# still be *misparsed*: JkProtocol.FIELD_OFFSET in particular is a value
+# verified against one specific piece of hardware, and other JK firmware/
+# board generations are documented (see diag/findings/PROTOCOL_NOTES.md) to
+# use a different offset. A wrong offset still produces a frame that passes
+# its checksum (the checksum only covers frame integrity, not field
+# meaning) but reads pack voltage/current/SOC from the wrong bytes - e.g.
+# picking up part of a cell-voltage array as if it were the SOC byte. The
+# result is a plausible-looking number, not an obvious garbage value or a
+# crash, so it would otherwise reach SignalK (and a boat's instruments)
+# silently. Rejecting readings outside physically-sane battery ranges turns
+# that silent-corruption failure mode into a visible "device not supported"
+# error instead.
+SOC_RANGE = (0, 100)
+PACK_VOLTAGE_RANGE = (0.5, 1000)  # single cell to a large series pack
+CURRENT_RANGE = (-2000, 2000)  # amps; generous headroom over any BMS this size
+
+
+def implausible_reading_reason(reading: dict) -> "str | None":
+    soc = reading.get("soc")
+    if soc is not None and not (SOC_RANGE[0] <= soc <= SOC_RANGE[1]):
+        return f"soc={soc} outside {SOC_RANGE[0]}-{SOC_RANGE[1]}%"
+    voltage = reading.get("packVoltage")
+    if voltage is not None and not (PACK_VOLTAGE_RANGE[0] <= voltage <= PACK_VOLTAGE_RANGE[1]):
+        return f"packVoltage={voltage} outside {PACK_VOLTAGE_RANGE[0]}-{PACK_VOLTAGE_RANGE[1]}V"
+    current = reading.get("current")
+    if current is not None and not (CURRENT_RANGE[0] <= current <= CURRENT_RANGE[1]):
+        return f"current={current} outside {CURRENT_RANGE[0]}-{CURRENT_RANGE[1]}A"
+    return None
+
     async def stream(self, client: BleakClient, on_reading, setup_lock: asyncio.Lock):
         """Subscribe to notifications and keep calling on_reading(dict) for
         every complete, validated frame received, for as long as the caller
@@ -462,6 +494,28 @@ async def run_device(device: dict, watchdog: Watchdog, connect_lock: asyncio.Loc
 
                 def on_reading(reading: dict):
                     watchdog.pet(device_id)
+                    reason = implausible_reading_reason(reading)
+                    if reason is not None:
+                        # Don't reconnect-loop on this - a wrong offset is a
+                        # static property of this device/firmware, not a
+                        # transient BLE hiccup, so retrying just repeats the
+                        # same misparse. Report once per reading instead so
+                        # the cause (not just "no data") is visible in the
+                        # plugin's SignalK status and this device's readings
+                        # never reach SignalK.
+                        log(f"{device_id}: implausible reading, dropped ({reason})")
+                        emit(
+                            {
+                                "id": device_id,
+                                "error": (
+                                    f"implausible reading ({reason}) - this BMS's firmware/"
+                                    "hardware generation may need a different field offset; "
+                                    "see diag/findings/PROTOCOL_NOTES.md and please open an "
+                                    "issue with your device model"
+                                ),
+                            }
+                        )
+                        return
                     emit({"id": device_id, **reading})
 
                 await protocol.stream(client, on_reading, connect_lock)

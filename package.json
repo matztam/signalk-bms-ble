@@ -13,7 +13,7 @@
     "node": ">=18"
   },
   "license": "AGPL-3.0-only",
-  "author": "",
+  "author": "matztam",
   "signalk": {
     "displayName": "BMS Status",
     "appIcon": "./icon.svg"
@@ -22,5 +22,11 @@
     "type": "git",
     "url": "github:matztam/signalk-bms-ble"
   },
-  "homepage": "https://github.com/matztam/signalk-bms-ble"
+  "bugs": {
+    "url": "https://github.com/matztam/signalk-bms-ble/issues"
+  },
+  "homepage": "https://github.com/matztam/signalk-bms-ble",
+  "scripts": {
+    "test": "node --test"
+  }
 }
