@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1
+
+- Fix a regression where `Protocol.stream` was accidentally defined
+  outside the `Protocol` class, causing every connection attempt to fail
+  with `'DalyProtocol' object has no attribute 'stream'`.
+- Fix the "device did not advertise" error being masked by a generic
+  "discover+connect exceeded 50s" message (Python 3.11+ makes
+  `asyncio.TimeoutError` and the builtin `TimeoutError` the same class,
+  so the outer error handler was catching both).
+
 ## 0.1.0
 
 Initial public release.
