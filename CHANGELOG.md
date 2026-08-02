@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Replace example device addresses and a couple of development-setup
+  references in the README and diagnostic notes with generic
+  placeholders (no functional change).
+
 ## 0.1.1
 
 - Fix a regression where `Protocol.stream` was accidentally defined
