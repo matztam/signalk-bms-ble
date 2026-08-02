@@ -212,17 +212,17 @@ address (see "Finding your device's Bluetooth address" above).
   process described above) pushed a 416MB Pi into swapping badly enough to
   make SignalK itself unresponsive. See `diag/findings/PROTOCOL_NOTES.md`.
 
-## Example: a real 3-battery setup
+## Example: a multi-battery setup
 
-For reference, this is what the device list looks like on the boat this
-plugin was originally built for — three BMS with the capacities they
-themselves report (not derived from any model number):
+For reference, a device list covering a JK-BMS house bank plus two Daly
+starter/house banks might look like this. Capacities are whatever each
+BMS itself reports (see above) — not derived from any model number:
 
-| id | type | address | display name | capacity |
-|---|---|---|---|---|
-| jk-1 | jk | 11:22:33:44:55:66 | Example-BMS | ~105 Ah |
-| daly-1 | daly | 11:22:33:44:55:67 | DL-EXAMPLE1 | ~280 Ah |
-| daly-2 | daly | 11:22:33:44:55:68 | DL-EXAMPLE2 | ~280 Ah |
+| id | type | address | capacity |
+|---|---|---|---|
+| house1 | jk | 11:22:33:44:55:66 | ~105 Ah |
+| starter | daly | 11:22:33:44:55:67 | ~100 Ah |
+| house2 | daly | 11:22:33:44:55:68 | ~280 Ah |
 
 ## License
 

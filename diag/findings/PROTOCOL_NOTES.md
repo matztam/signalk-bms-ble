@@ -1,11 +1,11 @@
-# Verifizierte Protokoll-Details (Stand 2026-07-30, Test auf Laptop development laptop)
+# Verifizierte Protokoll-Details
 
 ## Geräte-Zuordnung (BLE MAC-Adressen)
 
-- **JK-BMS** "Example-BMS" (JK-B2A8S20P): `11:22:33:44:55:66`
-- **Daly BMS 1**: `11:22:33:44:55:67` (Name: `DL-EXAMPLE1`)
-- **Daly BMS 2**: `11:22:33:44:55:68` (Name: `DL-EXAMPLE2`)
-- Balancer-eigene BLE-Geräte (NICHT relevant, ignorieren): `11:22:33:44:55:69`, `11:22:33:44:55:6a`
+- **JK-BMS** (JK-B2A8S20P): `11:22:33:44:55:66`
+- **Daly BMS 1**: `11:22:33:44:55:67`
+- **Daly BMS 2**: `11:22:33:44:55:68`
+- Balancer-eigene BLE-Geräte (NICHT relevant, ignorieren): eigene, benachbarte MAC-Adressen im selben Adapter-Adressraum
 
 ## JK-BMS (JK02-Protokoll, Header `55 AA EB 90`)
 
@@ -65,7 +65,7 @@ noch kein Cell-Info-Frame war. Grund für das Geräteverhalten unklar
 UART-Bridge-Chip angestoßen) — nicht weiter untersucht, da der Workaround
 zuverlässig funktioniert.
 
-## BLE-Adapter-Stabilität (Laptop development laptop, USB-BT-Adapter)
+## BLE-Adapter-Stabilität (development laptop, USB-BT-Adapter)
 
 - Nach vielen aufeinanderfolgenden Verbindungsversuchen/-abbrüchen (z.B. durch
   Testläufe, die per `timeout` hart gekillt wurden statt sauber zu disconnecten)
@@ -99,7 +99,8 @@ zuverlässig funktioniert.
     in mehreren Testläufen zu 100% zuverlässig: alle drei BMS liefern in
     jedem Round-Robin-Zyklus echte Daten, keine Hänger mehr beobachtet.
 - `signalk-beluga-core` (separates, bereits installiertes Plugin) advertised
-  den Laptop selbst als eigenes BLE-Peripheral-Gerät (under the configured device name). Ob/wie stark
+  den Laptop selbst als eigenes BLE-Peripheral-Gerät (unter dem konfigurierten
+  Gerätenamen). Ob/wie stark
   das den gleichzeitigen Central-Betrieb unseres Plugins auf demselben
   Adapter stört, ist nicht abschließend geklärt — beim Test mit
   deaktiviertem beluga-core traten weiterhin Verbindungsfehler auf, aber
@@ -289,7 +290,7 @@ bleibt verbunden, statt für jede Messung neu zu scannen/verbinden/trennen:
   einzelnes hängendes Gerät deutet eher auf einen verklemmten
   Adapter/DBus-Zustand hin als auf ein isoliertes Geräteproblem.
 
-**Live verifiziert (Laptop development laptop, vor Pi-Deployment)**:
+**Live verifiziert (development laptop, vor Pi-Deployment)**:
 - Beide Daly-Geräte gleichzeitig, 75s, 0 Fehler, durchgehend frische Daten
   (Request-Intervall 5s eingehalten).
 - Alle drei Geräte gleichzeitig (JK-1 in Reichweite, beide Daly außer
@@ -318,7 +319,7 @@ still (kein einziger Log-Eintrag, kein Timeout, keine Messung), bevor sich
 der Prozess von selbst erholte. Der `WATCHDOG_TIMEOUT_S=90`-Watchdog hätte
 das eigentlich abfangen müssen, tat es aber nicht.
 
-Lokale Reproduktion (Laptop development laptop, BlueZ 5.85) zeigte zunächst
+Lokale Reproduktion (development laptop, BlueZ 5.85) zeigte zunächst
 keinen Hänger über mehrere Minuten, dann aber — nach Neustart des Tests —
 wiederholt echte, mehrfach reproduzierbare Hänge von einzelnen
 `find_device_by_address()`-Aufrufen weit über ihren eigenen
