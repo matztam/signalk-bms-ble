@@ -113,6 +113,10 @@ voltage, current, capacity, time remaining, cell voltages), refreshing
 itself every 10s. Also listed as "BMS Status" in SignalK's own webapp
 overview (App Dock etc.).
 
+<img src="screenshots/status-page.png" alt="Status page on a phone, showing three battery cards with SOC bars, voltage, current, capacity and cell voltages" width="320">
+
+(Screenshot uses example data, not a live connection.)
+
 Technically a static page under `public/index.html`, mounted automatically
 by SignalK under `/<package-name>/` via the `signalk-webapp` keyword in
 `package.json` (the same mechanism used by e.g. `@signalk/freeboard-sk` or

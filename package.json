@@ -16,7 +16,10 @@
   "author": "matztam",
   "signalk": {
     "displayName": "BMS Status",
-    "appIcon": "./icon.svg"
+    "appIcon": "./icon.svg",
+    "screenshots": [
+      "./screenshots/status-page.png"
+    ]
   },
   "repository": {
     "type": "git",

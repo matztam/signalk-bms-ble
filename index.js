@@ -37,7 +37,7 @@ module.exports = function (app) {
   const CURRENT_SMOOTHING_TAU_S = 45
 
   function formatTime (ms) {
-    return new Date(ms).toLocaleTimeString('de-DE', { hour12: false })
+    return new Date(ms).toLocaleTimeString('en-GB', { hour12: false })
   }
 
   function statusIcon (r) {

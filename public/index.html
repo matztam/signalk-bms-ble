@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -121,7 +121,7 @@
   <h1>🔋 BMS Status</h1>
   <span class="time" id="time"></span>
 </header>
-<div id="cards"><p class="sub" style="padding:0 4px">Lade…</p></div>
+<div id="cards"><p class="sub" style="padding:0 4px">Loading…</p></div>
 
 <script>
   const REFRESH_MS = 10000
@@ -139,7 +139,7 @@
   }
 
   function formatTime (date) {
-    return date.toLocaleTimeString('de-DE', { hour12: false })
+    return date.toLocaleTimeString('en-GB', { hour12: false })
   }
 
   function formatDuration (seconds) {
@@ -163,7 +163,7 @@
     if (!Number.isFinite(soc) || !Number.isFinite(voltage) || !Number.isFinite(current)) {
       return `<section class="card muted">
         <h2>${title}</h2>
-        <p class="sub">unvollständige Daten</p>
+        <p class="sub">incomplete data</p>
       </section>`
     }
 
@@ -195,15 +195,15 @@
         <div class="soc-num">${socPct.toFixed(0)}%</div>
       </div>
       <div class="metrics">
-        <div class="metric"><span class="label">Spannung</span><span class="value">${voltage.toFixed(2)} V</span></div>
-        <div class="metric"><span class="label">Strom</span><span class="value">${current.toFixed(2)} A</span></div>
+        <div class="metric"><span class="label">Voltage</span><span class="value">${voltage.toFixed(2)} V</span></div>
+        <div class="metric"><span class="label">Current</span><span class="value">${current.toFixed(2)} A</span></div>
         ${hasCapacity
-          ? `<div class="metric"><span class="label">Kapazität</span><span class="value">${capacityAhValue.toFixed(1)} Ah</span></div>
-             <div class="metric"><span class="label">Restlaufzeit</span><span class="value">${timeRemainingText || '—'}</span></div>`
+          ? `<div class="metric"><span class="label">Capacity</span><span class="value">${capacityAhValue.toFixed(1)} Ah</span></div>
+             <div class="metric"><span class="label">Time remaining</span><span class="value">${timeRemainingText || '—'}</span></div>`
           : ''}
       </div>
       ${cells}
-      <p class="at">Letztes Update: ${latest ? formatTime(latest) : '?'}</p>
+      <p class="at">Last update: ${latest ? formatTime(latest) : '?'}</p>
     </section>`
   }
 
@@ -221,17 +221,17 @@
       // a stable/alphabetical order.
       const ids = Object.keys(batteries)
         .filter((id) => batteries[id]?.cellVoltages)
-        .sort((a, b) => a.localeCompare(b, 'de', { numeric: true }))
+        .sort((a, b) => a.localeCompare(b, 'en', { numeric: true }))
 
       const container = document.getElementById('cards')
       if (ids.length === 0) {
-        container.innerHTML = '<p class="sub" style="padding:0 4px">Keine BMS-Geräte gefunden.</p>'
+        container.innerHTML = '<p class="sub" style="padding:0 4px">No BMS devices found.</p>'
         return
       }
       container.innerHTML = ids.map((id) => renderCard(id, batteries[id])).join('\n')
     } catch (err) {
       document.getElementById('cards').innerHTML =
-        `<section class="card error"><h2>Fehler</h2><p class="sub">${escapeHtml(err.message)}</p></section>`
+        `<section class="card error"><h2>Error</h2><p class="sub">${escapeHtml(err.message)}</p></section>`
     }
   }
 
