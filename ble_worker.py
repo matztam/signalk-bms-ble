@@ -106,6 +106,38 @@ def emit(obj):
     print(json.dumps(obj), flush=True)
 
 
+# Sanity bounds applied to every parsed reading regardless of protocol,
+# before it's published. These exist because a checksum-valid frame can
+# still be *misparsed*: JkProtocol.FIELD_OFFSET in particular is a value
+# verified against one specific piece of hardware, and other JK firmware/
+# board generations are documented (see diag/findings/PROTOCOL_NOTES.md) to
+# use a different offset. A wrong offset still produces a frame that passes
+# its checksum (the checksum only covers frame integrity, not field
+# meaning) but reads pack voltage/current/SOC from the wrong bytes - e.g.
+# picking up part of a cell-voltage array as if it were the SOC byte. The
+# result is a plausible-looking number, not an obvious garbage value or a
+# crash, so it would otherwise reach SignalK (and a boat's instruments)
+# silently. Rejecting readings outside physically-sane battery ranges turns
+# that silent-corruption failure mode into a visible "device not supported"
+# error instead.
+SOC_RANGE = (0, 100)
+PACK_VOLTAGE_RANGE = (0.5, 1000)  # single cell to a large series pack
+CURRENT_RANGE = (-2000, 2000)  # amps; generous headroom over any BMS this size
+
+
+def implausible_reading_reason(reading: dict) -> "str | None":
+    soc = reading.get("soc")
+    if soc is not None and not (SOC_RANGE[0] <= soc <= SOC_RANGE[1]):
+        return f"soc={soc} outside {SOC_RANGE[0]}-{SOC_RANGE[1]}%"
+    voltage = reading.get("packVoltage")
+    if voltage is not None and not (PACK_VOLTAGE_RANGE[0] <= voltage <= PACK_VOLTAGE_RANGE[1]):
+        return f"packVoltage={voltage} outside {PACK_VOLTAGE_RANGE[0]}-{PACK_VOLTAGE_RANGE[1]}V"
+    current = reading.get("current")
+    if current is not None and not (CURRENT_RANGE[0] <= current <= CURRENT_RANGE[1]):
+        return f"current={current} outside {CURRENT_RANGE[0]}-{CURRENT_RANGE[1]}A"
+    return None
+
+
 class Protocol:
     """Base class for a BMS BLE protocol. One instance per device."""
 
@@ -139,38 +171,6 @@ class Protocol:
         """Feed one notification's raw bytes. Return a parsed reading dict
         once a complete, validated frame has been assembled, else None."""
         raise NotImplementedError
-
-
-# Sanity bounds applied to every parsed reading regardless of protocol,
-# before it's published. These exist because a checksum-valid frame can
-# still be *misparsed*: JkProtocol.FIELD_OFFSET in particular is a value
-# verified against one specific piece of hardware, and other JK firmware/
-# board generations are documented (see diag/findings/PROTOCOL_NOTES.md) to
-# use a different offset. A wrong offset still produces a frame that passes
-# its checksum (the checksum only covers frame integrity, not field
-# meaning) but reads pack voltage/current/SOC from the wrong bytes - e.g.
-# picking up part of a cell-voltage array as if it were the SOC byte. The
-# result is a plausible-looking number, not an obvious garbage value or a
-# crash, so it would otherwise reach SignalK (and a boat's instruments)
-# silently. Rejecting readings outside physically-sane battery ranges turns
-# that silent-corruption failure mode into a visible "device not supported"
-# error instead.
-SOC_RANGE = (0, 100)
-PACK_VOLTAGE_RANGE = (0.5, 1000)  # single cell to a large series pack
-CURRENT_RANGE = (-2000, 2000)  # amps; generous headroom over any BMS this size
-
-
-def implausible_reading_reason(reading: dict) -> "str | None":
-    soc = reading.get("soc")
-    if soc is not None and not (SOC_RANGE[0] <= soc <= SOC_RANGE[1]):
-        return f"soc={soc} outside {SOC_RANGE[0]}-{SOC_RANGE[1]}%"
-    voltage = reading.get("packVoltage")
-    if voltage is not None and not (PACK_VOLTAGE_RANGE[0] <= voltage <= PACK_VOLTAGE_RANGE[1]):
-        return f"packVoltage={voltage} outside {PACK_VOLTAGE_RANGE[0]}-{PACK_VOLTAGE_RANGE[1]}V"
-    current = reading.get("current")
-    if current is not None and not (CURRENT_RANGE[0] <= current <= CURRENT_RANGE[1]):
-        return f"current={current} outside {CURRENT_RANGE[0]}-{CURRENT_RANGE[1]}A"
-    return None
 
     async def stream(self, client: BleakClient, on_reading, setup_lock: asyncio.Lock):
         """Subscribe to notifications and keep calling on_reading(dict) for
@@ -455,7 +455,15 @@ async def run_device(device: dict, watchdog: Watchdog, connect_lock: asyncio.Loc
         async with connect_lock:
             found = await BleakScanner.find_device_by_address(device["address"], timeout=DISCOVER_TIMEOUT_S)
             if found is None:
-                raise TimeoutError(f"{device['address']} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
+                # Deliberately not TimeoutError: asyncio.TimeoutError is the
+                # same class as the builtin TimeoutError (since Python
+                # 3.11), so raising TimeoutError here would also be caught
+                # by the `except asyncio.TimeoutError` below - masking this
+                # more specific, faster-to-happen ("device isn't advertising")
+                # failure behind the generic "50s exceeded, BlueZ might be
+                # stuck" message and its much longer LOCK_TIMEOUT_S in the
+                # log, even though this raises after DISCOVER_TIMEOUT_S.
+                raise RuntimeError(f"{device['address']} did not advertise within {DISCOVER_TIMEOUT_S:.0f}s")
             client = BleakClient(found, timeout=CONNECT_TIMEOUT_S)
             await client.connect()
             # BlueZ sometimes reports the connection as established
