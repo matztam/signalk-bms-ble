@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.2
+
+- The server-BLE-API backend now recovers from two failure modes that
+  previously left a device stuck with no updates until the plugin was
+  restarted:
+  - A connection that stops delivering notifications without the server
+    ever reporting a disconnect (e.g. a silent BlueZ-level hiccup) is now
+    force-reconnected after 20 seconds without data, instead of sitting
+    there looking "connected" forever.
+  - Repeated `subscribeGATT` failures with "No provider ... can see
+    &lt;mac&gt;" (the device simply isn't in the server's view) now get a
+    diagnostic hint after about a minute of consecutive failures,
+    pointing at BlueZ potentially already holding a stale/orphaned
+    connection to the device from an earlier attempt that was never
+    cleanly closed - a state this plugin has no way to fix itself, but
+    `bluetoothctl disconnect <mac>` on the server does. Confirmed live:
+    exactly this situation was found and fixed this way on a device that
+    had gone stale for several minutes.
+
 ## 0.2.1
 
 - Fix the server-BLE-API backend's GATT writes (JK's init writes, Daly's
