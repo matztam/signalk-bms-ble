@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0
+
+- Use signalk-server's built-in BLE Provider API (`app.bleApi`, added in
+  signalk-server 2.31.0) when available, instead of always spawning the
+  Python `ble_worker.py` subprocess. The server now owns BLE discovery,
+  GATT connection lifecycle, and reconnection directly - no Python, no
+  venv, no hand-rolled connect-serialization lock or watchdog thread on
+  servers that have it. Automatically falls back to the existing Python
+  worker on older servers, so this is a drop-in upgrade either way; the
+  plugin config page and SignalK log report which backend is active.
+- Added `lib/protocols/jk.js` and `lib/protocols/daly.js`, plain-JS ports
+  of the frame parsing previously only implemented in `ble_worker.py`,
+  shared by the new server-BLE-API backend.
+
 ## 0.1.2
 
 - Replace example device addresses and a couple of development-setup

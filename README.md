@@ -22,21 +22,12 @@ support for that variant can be added.
 
 ## Requirements
 
+This plugin has two ways of talking to BLE hardware — it picks automatically,
+see "Two BLE backends" under Architecture below.
+
 - SignalK server, Node.js >= 18.
 - **Linux with BlueZ.** Developed and tested on Raspberry Pi OS / Debian
-  with BlueZ 5.66-5.85. The Python BLE library used here (`bleak`) also has
-  macOS (CoreBluetooth) and Windows (WinRT) backends, so those platforms may
-  work, but this plugin's connection retry/timeout/watchdog logic was
-  written against BlueZ-specific behavior and hasn't been exercised there.
-- **Python 3** with the standard `venv` module. On Debian/Ubuntu/Raspberry
-  Pi OS this is a separate package from the base `python3` install:
-  ```
-  sudo apt install python3-venv
-  ```
-  Without it, the plugin's first-run virtual environment setup fails with
-  an `ensurepip is not available` error.
-- Internet access on first plugin start (to `pip install bleak` into the
-  plugin's own virtual environment, created automatically under `.venv/`).
+  with BlueZ 5.66-5.85.
 - **Bluetooth permissions.** SignalK typically runs as a non-root user. On
   most distros that user needs to be in the `bluetooth` group (or have
   equivalent BlueZ D-Bus policy permissions) to use Bluetooth LE at all:
@@ -46,6 +37,23 @@ support for that variant can be added.
   then log the user out/in (or reboot) for the group change to take
   effect. Without this, connections typically fail with a permission or
   D-Bus access error.
+
+**Only if signalk-server is older than 2.31.0** (no built-in BLE API, see
+below — the plugin falls back to its own Python worker in that case):
+
+- **Python 3** with the standard `venv` module. On Debian/Ubuntu/Raspberry
+  Pi OS this is a separate package from the base `python3` install:
+  ```
+  sudo apt install python3-venv
+  ```
+  Without it, the plugin's first-run virtual environment setup fails with
+  an `ensurepip is not available` error.
+- Internet access on first plugin start (to `pip install bleak` into the
+  plugin's own virtual environment, created automatically under `.venv/`).
+  The Python BLE library used here (`bleak`) also has macOS (CoreBluetooth)
+  and Windows (WinRT) backends, so those platforms may work for the
+  fallback path, but its connection retry/timeout/watchdog logic was
+  written against BlueZ-specific behavior and hasn't been exercised there.
 
 ## Installation
 
@@ -128,56 +136,88 @@ server-side rendering code in the plugin itself.
 
 ## Architecture
 
-- `ble_worker.py` — **a single long-lived** Python process (via
-  `bleak`/BlueZ-DBus). Each configured BMS gets its own `asyncio` task that
-  **connects once and stays connected** (no poll/disconnect cycle),
-  continuously receiving readings via BLE notifications. Discovery+connect
-  attempts are serialized across all devices via a shared `asyncio.Lock`
-  (BlueZ only allows one such operation at a time), bounded by an outer
-  timeout (`LOCK_TIMEOUT_S`) so one stuck device can't block the others. A
-  watchdog thread hard-exits the whole process if something still hangs
-  past `WATCHDOG_TIMEOUT_S`. Results go to stdout as newline-delimited
-  JSON. Runs in its own virtual environment (`.venv/`, created
-  automatically on first plugin start). See `diag/findings/PROTOCOL_NOTES.md`
-  for the decision history (including why persistent connections instead of
-  poll cycles).
-- `lib/bleWorker.js` — spawns/supervises the Python process, parses its
-  JSON lines, restarts it automatically on crash.
-- `index.js` — SignalK plugin entry point: config schema (device list,
-  per-device enable/disable), converts readings into SignalK deltas
-  (including converting the BMS-reported Ah capacity into SignalK's
-  joule-based `capacity.actual`/`.remaining`/`.timeRemaining`, using a
-  smoothed current for the time-remaining calculation), shows live values
-  on the plugin config page.
+### Two BLE backends
 
-**Why a Python process instead of a pure Node BLE module?**
-`@abandonware/noble` typically needs exclusive HCI access and conflicts
-with a running `bluetoothd`. `node-ble` (DBus/BlueZ, like bleak) was
-tested but hung indefinitely on connect, with no timeout of its own.
-`bleak` is the only library that proved reliable against the real
-hardware — see `diag/findings/PROTOCOL_NOTES.md`.
+`plugin.start()` checks whether `app.bleApi` exists (added in
+`signalk-server` 2.31.0's built-in [BLE Provider
+API](https://github.com/SignalK/signalk-server/pull/2588)) and picks the
+transport accordingly — the plugin config page and SignalK log ("Running
+(server BLE API) — ..." vs "Running (Python worker) — ...") say which one is
+active:
+
+- **Server BLE API (preferred, signalk-server >= 2.31.0)** —
+  `lib/bleApiWorker.js` declares a `GATTSubscriptionDescriptor` per device
+  (service UUID, notify characteristic, and either init writes for JK's
+  "wake up and start streaming" nudge or a periodic write for Daly's
+  "answer once per request" behavior — see `lib/protocols/jk.js` and
+  `lib/protocols/daly.js`) and hands it to `app.bleApi.subscribeGATT()`.
+  The server then owns discovery, connection lifecycle, provider
+  selection, and reconnection — no Python subprocess, no venv, no
+  hand-rolled connect-serialization lock or watchdog thread. Frame
+  reassembly/parsing (`lib/protocols/*.js`) and the physical-sanity check
+  (`lib/protocols/sanity.js`) are plain JS ports of the same logic
+  `ble_worker.py` uses, so both backends produce identical readings.
+- **Python worker (fallback, older servers)** — `ble_worker.py`, **a
+  single long-lived** Python process (via `bleak`/BlueZ-DBus), spawned and
+  supervised by `lib/bleWorker.js`. Each configured BMS gets its own
+  `asyncio` task that **connects once and stays connected** (no
+  poll/disconnect cycle), continuously receiving readings via BLE
+  notifications. Discovery+connect attempts are serialized across all
+  devices via a shared `asyncio.Lock` (BlueZ only allows one such
+  operation at a time), bounded by an outer timeout (`LOCK_TIMEOUT_S`) so
+  one stuck device can't block the others. A watchdog thread hard-exits
+  the whole process if something still hangs past `WATCHDOG_TIMEOUT_S`.
+  Runs in its own virtual environment (`.venv/`, created automatically on
+  first plugin start). See `diag/findings/PROTOCOL_NOTES.md` for the
+  decision history (including why persistent connections instead of poll
+  cycles, and why Python/`bleak` instead of a pure Node BLE module —
+  `@abandonware/noble` typically needs exclusive HCI access and conflicts
+  with a running `bluetoothd`, and `node-ble` hung indefinitely on connect
+  in testing).
+
+Both backends feed the same `onReading(msg)` callback shape into
+`index.js`, so everything below this point (SignalK delta conversion,
+capacity math, the status page, the config schema) is backend-agnostic.
+
+- `index.js` — SignalK plugin entry point: picks the backend, config
+  schema (device list, per-device enable/disable), converts readings into
+  SignalK deltas (including converting the BMS-reported Ah capacity into
+  SignalK's joule-based `capacity.actual`/`.remaining`/`.timeRemaining`,
+  using a smoothed current for the time-remaining calculation), shows live
+  values on the plugin config page.
 
 **Why persistent connections instead of poll/disconnect cycles?**
-An earlier approach reconnected for every reading (discover → connect →
-read → disconnect). Repeated discovery turned out live to be the main
-source of intermittent "did not advertise" failures — a device could work
-reliably for many cycles and then fail several times in a row, even though
-a plain `bluetoothctl scan` always found it. A live experiment also
-confirmed that a single BLE adapter can hold several simultaneously open
-connections — BlueZ's "only one operation at a time" limit applies only to
-*establishing* connections, not to *holding* them open. Details in
-`diag/findings/PROTOCOL_NOTES.md`.
+An earlier approach (predating both current backends) reconnected for
+every reading (discover → connect → read → disconnect). Repeated discovery
+turned out live to be the main source of intermittent "did not advertise"
+failures — a device could work reliably for many cycles and then fail
+several times in a row, even though a plain `bluetoothctl scan` always
+found it. A live experiment also confirmed that a single BLE adapter can
+hold several simultaneously open connections — BlueZ's "only one operation
+at a time" limit applies only to *establishing* connections, not to
+*holding* them open. Details in `diag/findings/PROTOCOL_NOTES.md`.
 
 ## Adding a new BMS brand
 
-1. In `ble_worker.py`: write a new `Protocol` subclass (see
+Needs implementing on both backends, since either can be active depending on
+the server version:
+
+1. In `lib/protocols/`: add a new file (see `jk.js`/`daly.js` as templates)
+   exporting the service/characteristic UUIDs, a frame parser, and either
+   the init writes needed to start the device streaming or a periodic
+   request builder — whichever the device needs (see `daly.js`'s
+   `REQUEST_INTERVAL_MS` vs `jk.js`'s `initWrites`).
+2. In `lib/bleApiWorker.js`: add a branch in `_subscribe()`'s descriptor
+   switch for the new type.
+3. In `ble_worker.py`: write a new `Protocol` subclass (see
    `JkProtocol`/`DalyProtocol` as templates) — implement `notify_char`,
    `write_char`, `request()`, `feed()`; optionally `extra_requests()` (if
    the device only starts pushing live data after a second request) and
    `request_interval_s` (if the device doesn't keep pushing on its own and
    needs periodic re-requesting — see `DalyProtocol`). Register it in
-   `PROTOCOLS`.
-2. In `index.js`: add the new type key + display name to `KNOWN_TYPES`.
+   `PROTOCOLS`. This keeps the fallback path working for servers older
+   than 2.31.0.
+4. In `index.js`: add the new type key + display name to `KNOWN_TYPES`.
 
 No other code needs to change — the device list in the plugin config stays
 MAC-address-based and type-agnostic.

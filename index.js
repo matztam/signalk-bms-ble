@@ -1,10 +1,14 @@
 'use strict'
 
 const BleWorker = require('./lib/bleWorker')
+const BleApiWorker = require('./lib/bleApiWorker')
 
 // Device "type" values this plugin currently understands. Adding a new
-// brand/protocol: implement it in ble_worker.py (see the PROTOCOLS registry
-// there) and add its key + label here so it shows up in the config UI.
+// brand/protocol: implement it in lib/protocols/ (see jk.js/daly.js as
+// templates) and wire it into lib/bleApiWorker.js's descriptor switch,
+// AND in ble_worker.py's PROTOCOLS registry (the Python fallback for
+// servers older than 2.31.0 - see plugin.start() below) - then add its
+// key + label here so it shows up in the config UI.
 const KNOWN_TYPES = {
   jk: 'JK-BMS (JK02 protocol)',
   daly: 'Daly Smart BMS (D2 protocol)'
@@ -177,14 +181,23 @@ module.exports = function (app) {
       return
     }
 
-    bleWorker = new BleWorker({
+    // Prefer the server-managed BLE API (signalk-server >= 2.31.0):
+    // no Python subprocess, no venv setup, no hand-rolled connect
+    // locking/watchdog - the server handles discovery, GATT connection
+    // lifecycle, and reconnection itself. Falls back to the Python
+    // worker (ble_worker.py via BleWorker) on older servers where
+    // app.bleApi doesn't exist.
+    const usingBleApi = Boolean(app.bleApi)
+    const WorkerClass = usingBleApi ? BleApiWorker : BleWorker
+    bleWorker = new WorkerClass({
       app,
       devices,
       onReading: (msg) => publishReading(msg)
     })
     bleWorker.start()
 
-    statusText = `Running — polling ${devices.length} device(s): ${devices.map((d) => d.id).join(', ')}`
+    const mode = usingBleApi ? 'server BLE API' : 'Python worker (upgrade signalk-server to >=2.31.0 for the built-in BLE API)'
+    statusText = `Running (${mode}) — polling ${devices.length} device(s): ${devices.map((d) => d.id).join(', ')}`
     if (disabled.length > 0) statusText += ` (${disabled.length} disabled: ${disabled.map((d) => d.id).join(', ')})`
     app.setPluginStatus(statusText)
   }

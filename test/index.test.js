@@ -35,16 +35,47 @@ require.cache[bleWorkerPath] = {
   exports: FakeBleWorker
 }
 
+// Same stubbing approach for lib/bleApiWorker (the app.bleApi-based
+// worker, chosen instead of BleWorker when app.bleApi is present - see
+// index.js's plugin.start()).
+const bleApiWorkerPath = require.resolve('../lib/bleApiWorker')
+
+class FakeBleApiWorker {
+  constructor ({ onReading }) {
+    FakeBleApiWorker.lastInstance = this
+    this.onReading = onReading
+    this.started = false
+    this.stopped = false
+  }
+
+  start () {
+    this.started = true
+  }
+
+  stop () {
+    this.stopped = true
+  }
+}
+
+require.cache[bleApiWorkerPath] = {
+  id: bleApiWorkerPath,
+  filename: bleApiWorkerPath,
+  loaded: true,
+  exports: FakeBleApiWorker
+}
+
 const pluginFactory = require('../index')
 
-function createApp () {
-  return {
+function createApp ({ bleApi } = {}) {
+  const app = {
     debug: mock.fn(),
     error: mock.fn(),
     setPluginStatus: mock.fn(),
     setPluginError: mock.fn(),
     handleMessage: mock.fn()
   }
+  if (bleApi) app.bleApi = bleApi
+  return app
 }
 
 function deltaValues (app) {
@@ -282,4 +313,45 @@ test('current smoothing converges toward a step change rather than jumping insta
     secondTimeRemaining > instantaneousTimeRemaining * 2,
     `expected smoothed timeRemaining (${secondTimeRemaining}) to still be well above the instantaneous value (${instantaneousTimeRemaining}) immediately after a step change`
   )
+})
+
+test('start() uses the Python worker (BleWorker) when app.bleApi is absent', () => {
+  const app = createApp()
+  const plugin = pluginFactory(app)
+  FakeBleWorker.lastInstance = undefined
+  FakeBleApiWorker.lastInstance = undefined
+
+  plugin.start({ devices: [{ id: 'house1', type: 'jk', address: '11:22:33:44:55:66' }] })
+
+  assert.ok(FakeBleWorker.lastInstance)
+  assert.equal(FakeBleWorker.lastInstance.started, true)
+  assert.equal(FakeBleApiWorker.lastInstance, undefined)
+  assert.match(app.setPluginStatus.mock.calls.at(-1).arguments[0], /Python worker/)
+})
+
+test('start() uses the server BLE API worker when app.bleApi is present', () => {
+  const app = createApp({ bleApi: { subscribeGATT: mock.fn() } })
+  const plugin = pluginFactory(app)
+  FakeBleWorker.lastInstance = undefined
+  FakeBleApiWorker.lastInstance = undefined
+
+  plugin.start({ devices: [{ id: 'house1', type: 'jk', address: '11:22:33:44:55:66' }] })
+
+  assert.ok(FakeBleApiWorker.lastInstance)
+  assert.equal(FakeBleApiWorker.lastInstance.started, true)
+  assert.equal(FakeBleWorker.lastInstance, undefined)
+  assert.match(app.setPluginStatus.mock.calls.at(-1).arguments[0], /server BLE API/)
+})
+
+test('capacity/current-smoothing logic behaves identically via the BLE API worker path', () => {
+  const app = createApp({ bleApi: { subscribeGATT: mock.fn() } })
+  const plugin = pluginFactory(app)
+  plugin.start({ devices: [{ id: 'house1', type: 'jk', address: '11:22:33:44:55:66' }] })
+
+  FakeBleApiWorker.lastInstance.onReading({
+    id: 'house1', soc: 50, packVoltage: 13.3, current: -10, fullChargeCapacityAh: 100
+  })
+
+  const values = deltaValues(app)
+  assert.ok(Math.abs(values['electrical.batteries.house1.capacity.timeRemaining'] - 18000) < 1e-6)
 })
