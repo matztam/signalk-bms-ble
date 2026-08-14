@@ -25,14 +25,18 @@ function createApp ({ subscribeGATTImpl } = {}) {
     if (subscribeGATTImpl) return subscribeGATTImpl(descriptor, pluginId, callback)
     return createFakeHandle()
   })
+  const unsubscribeAdvertisements = mock.fn()
+  const onAdvertisement = mock.fn((_pluginId, _callback) => unsubscribeAdvertisements)
 
   return {
     app: {
       debug: mock.fn(),
       pluginId: 'signalk-bms-ble',
-      bleApi: { subscribeGATT }
+      bleApi: { subscribeGATT, onAdvertisement }
     },
     subscribeGATT,
+    onAdvertisement,
+    unsubscribeAdvertisements,
     notificationCallbacks
   }
 }
@@ -51,6 +55,11 @@ test('subscribes to a JK device with the correct descriptor (service, notify, in
   assert.deepEqual(descriptor.notify, [jk.NOTIFY_CHAR])
   assert.equal(descriptor.init.length, 2)
   assert.equal(descriptor.init[0].uuid, jk.NOTIFY_CHAR)
+  // Write-without-response - the server's default (with response) gets
+  // "Write not permitted" back from real hardware; see the comment in
+  // bleApiWorker.js's descriptor construction.
+  assert.equal(descriptor.init[0].withResponse, false)
+  assert.equal(descriptor.init[1].withResponse, false)
   assert.equal(pluginId, 'signalk-bms-ble')
 })
 
@@ -67,6 +76,7 @@ test('subscribes to a Daly device with a periodic write descriptor', async () =>
   assert.equal(descriptor.periodicWrite.length, 1)
   assert.equal(descriptor.periodicWrite[0].uuid, daly.WRITE_CHAR)
   assert.equal(descriptor.periodicWrite[0].intervalMs, daly.REQUEST_INTERVAL_MS)
+  assert.equal(descriptor.periodicWrite[0].withResponse, false)
 })
 
 test('a JK notification chunk is parsed and forwards a reading via onReading', async () => {
@@ -135,7 +145,7 @@ test('an implausible reading is reported as an error instead of published', asyn
   assert.match(readings[0].error, /implausible reading/)
 })
 
-test('subscribeGATT failure is reported via onReading as an error', async () => {
+test('subscribeGATT failure is reported via onReading as an error, then retried', async () => {
   const { app } = createApp({ subscribeGATTImpl: async () => { throw new Error('device not found') } })
   const readings = []
   const worker = new BleApiWorker({ app, devices: [{ id: 'house1', type: 'jk', address: '11:22:33:44:55:66' }], onReading: (msg) => readings.push(msg) })
@@ -146,6 +156,37 @@ test('subscribeGATT failure is reported via onReading as an error', async () => 
   assert.equal(readings.length, 1)
   assert.equal(readings[0].id, 'house1')
   assert.match(readings[0].error, /device not found/)
+
+  // stop() must cancel the pending retry-backoff wait immediately, both so
+  // the plugin actually stops promptly and so this test doesn't keep the
+  // process alive for RETRY_DELAY_MS.
+  await worker.stop()
+})
+
+test('a permanently failing subscribeGATT is retried, not given up on', async () => {
+  let attempts = 0
+  const { app } = createApp({
+    subscribeGATTImpl: async () => {
+      attempts++
+      throw new Error('No provider with GATT support and available slots can see 11:22:33:44:55:66')
+    }
+  })
+  const readings = []
+  const worker = new BleApiWorker({ app, devices: [{ id: 'house1', type: 'jk', address: '11:22:33:44:55:66' }], onReading: (msg) => readings.push(msg) })
+
+  worker.start()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(attempts, 1)
+
+  // Force the retry backoff to elapse immediately instead of waiting out
+  // the real RETRY_DELAY_MS, by resolving the worker's own pending timer.
+  for (const entry of worker._retryTimers) entry.clear()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(attempts, 2)
+  assert.equal(readings.length, 2)
+
+  await worker.stop()
 })
 
 test('stop() closes all open GATT handles', async () => {
@@ -168,4 +209,32 @@ test('an unknown device type is skipped without calling subscribeGATT', async ()
   await new Promise((resolve) => setImmediate(resolve))
 
   assert.equal(subscribeGATT.mock.calls.length, 0)
+})
+
+test('start() subscribes to the advertisement stream so the server\'s device table gets populated', async () => {
+  // Without an onAdvertisement() subscriber, signalk-server's local BLE
+  // provider discards every advertisement it sees instead of recording it
+  // (LocalBLEProvider.emitDeviceAdvertisement bails out early when there
+  // are no subscribers) - so subscribeGATT() would otherwise fail forever
+  // with "No provider ... can see <mac>" even for a device that's right
+  // there and discoverable. We don't care about the advertisement payload
+  // itself, only that subscribing keeps the device table populated.
+  const { app, onAdvertisement } = createApp()
+  const worker = new BleApiWorker({ app, devices: [{ id: 'house1', type: 'jk', address: '11:22:33:44:55:66' }], onReading: () => {} })
+
+  worker.start()
+
+  assert.equal(onAdvertisement.mock.calls.length, 1)
+  assert.equal(onAdvertisement.mock.calls[0].arguments[0], 'signalk-bms-ble')
+})
+
+test('stop() unsubscribes from the advertisement stream', async () => {
+  const { app, unsubscribeAdvertisements } = createApp()
+  const worker = new BleApiWorker({ app, devices: [{ id: 'house1', type: 'jk', address: '11:22:33:44:55:66' }], onReading: () => {} })
+
+  worker.start()
+  await new Promise((resolve) => setImmediate(resolve))
+  await worker.stop()
+
+  assert.equal(unsubscribeAdvertisements.mock.calls.length, 1)
 })

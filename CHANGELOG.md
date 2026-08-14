@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+- Fix the server-BLE-API backend's GATT writes (JK's init writes, Daly's
+  periodic request write) failing with `Write not permitted` on real
+  hardware. The server's default is write-*with*-response; these
+  devices' write characteristics only accept write-*without*-response,
+  same as the Python fallback already did
+  (`write_gatt_char(..., response=False)`). The new backend's
+  descriptors now set `withResponse: false` to match.
+
 ## 0.2.0
 
 - Use signalk-server's built-in BLE Provider API (`app.bleApi`, added in
