@@ -275,6 +275,27 @@ test('capacity.timeRemaining is omitted while charging or idle', () => {
   assert.ok('electrical.batteries.house1.capacity.actual' in values)
 })
 
+test('capacity.timeRemaining is omitted when discharge current is near zero (avoids a meaningless huge value)', () => {
+  const app = createApp()
+  const plugin = pluginFactory(app)
+  plugin.start({ devices: [{ id: 'house1', type: 'jk', address: '11:11:11:11:11:11' }] })
+
+  // Technically discharging (current < 0) but small enough to be noise
+  // around zero - dividing remainingAh by this would otherwise produce a
+  // technically-finite but absurd number of hours.
+  FakeBleWorker.lastInstance.onReading({
+    id: 'house1',
+    soc: 50,
+    packVoltage: 13.3,
+    current: -0.001,
+    fullChargeCapacityAh: 100
+  })
+
+  const values = deltaValues(app)
+  assert.equal('electrical.batteries.house1.capacity.timeRemaining' in values, false)
+  assert.ok('electrical.batteries.house1.capacity.actual' in values)
+})
+
 test('capacity fields are omitted entirely when the BMS reports no capacity', () => {
   const app = createApp()
   const plugin = pluginFactory(app)

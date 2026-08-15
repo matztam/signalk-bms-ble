@@ -40,6 +40,13 @@ module.exports = function (app) {
   const smoothedCurrent = new Map()
   const CURRENT_SMOOTHING_TAU_S = 45
 
+  // Below this, treat the discharge current as noise around zero rather
+  // than a real draw - capacity.timeRemaining divides by current, so a
+  // smoothed value that's merely very small (not exactly zero) still
+  // produces a technically-finite but meaningless result (e.g. hundreds of
+  // thousands of hours) instead of being caught by an isFinite check.
+  const MIN_DISCHARGE_CURRENT_A = 0.05
+
   function formatTime (ms) {
     return new Date(ms).toLocaleTimeString('en-GB', { hour12: false })
   }
@@ -278,7 +285,7 @@ module.exports = function (app) {
         // Only meaningful while discharging (current < 0, per SignalK's
         // sign convention) - charging or idle has no "time until empty".
         const avgCurrent = isFiniteNumber(msg.current) ? smoothCurrent(id, msg.current) : undefined
-        if (isFiniteNumber(avgCurrent) && avgCurrent < 0) {
+        if (isFiniteNumber(avgCurrent) && avgCurrent < -MIN_DISCHARGE_CURRENT_A) {
           const timeRemainingS = (remainingAh / -avgCurrent) * 3600
           values.push({ path: `${path}.capacity.timeRemaining`, value: timeRemainingS })
         }

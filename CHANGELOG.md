@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.3
+
+- Fix `capacity.timeRemaining` showing absurd values (e.g. "7.9e+29 h")
+  on the status page when the discharge current is very close to zero
+  (noise around zero right after a charge/discharge transition, before
+  current smoothing settles). The value was technically finite, so it
+  slipped past the existing `Number.isFinite` guard on the status page.
+  Now suppressed (shows "—") whenever the smoothed discharge current is
+  below 0.05 A, the same way it's already suppressed while charging or
+  idle.
+
 ## 0.2.2
 
 - The server-BLE-API backend now recovers from two failure modes that
