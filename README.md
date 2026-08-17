@@ -107,7 +107,7 @@ Per configured device, under `electrical.batteries.<id>.*`:
 | `cellVoltages.<n>.voltage` | Individual cell voltages | always |
 | `capacity.actual` | Current full-charge capacity in J (BMS-reported Ah × voltage × 3600 — not a fixed nameplate value, drifts with cell aging/calibration) | when the BMS reports a capacity |
 | `capacity.remaining` | Remaining capacity in J (SOC × `capacity.actual`) | same as above |
-| `capacity.timeRemaining` | Time to empty in s | same as above, only while discharging (`current < 0`); uses a smoothed current (~45s time constant) so brief load spikes don't make the value jump around |
+| `capacity.timeRemaining` | Time to empty in s | same as above, only while discharging with the smoothed current below -0.05 A; uses a smoothed current (~45s time constant) so brief load spikes don't make the value jump around, and the 0.05 A floor avoids a technically-finite but meaningless huge value (e.g. hundreds of thousands of hours) when the smoothed current is merely very close to zero |
 
 `capacity.timeRemaining` is what an NMEA2000 plotter (PGN 127506) shows as
 "time remaining" next to SOC/voltage/current.
@@ -153,10 +153,23 @@ active:
   `lib/protocols/daly.js`) and hands it to `app.bleApi.subscribeGATT()`.
   The server then owns discovery, connection lifecycle, provider
   selection, and reconnection — no Python subprocess, no venv, no
-  hand-rolled connect-serialization lock or watchdog thread. Frame
-  reassembly/parsing (`lib/protocols/*.js`) and the physical-sanity check
+  hand-rolled connect-serialization lock. Frame reassembly/parsing
+  (`lib/protocols/*.js`) and the physical-sanity check
   (`lib/protocols/sanity.js`) are plain JS ports of the same logic
   `ble_worker.py` uses, so both backends produce identical readings.
+  `bleApiWorker.js` does still run its own small recovery layer on top of
+  what the server guarantees:
+  - a per-device data-timeout watchdog force-reconnects a connection that
+    goes quiet for 20s without delivering a notification, since the
+    server's `onDisconnect` callback only fires on an actual BlueZ-level
+    disconnect and doesn't cover a subscription that's silently stopped
+    producing data;
+  - if `subscribeGATT()` keeps failing with "No provider ... can see
+    &lt;mac&gt;" for about a minute straight, the reported error gets a
+    diagnostic hint pointing at a likely cause the plugin can't fix
+    itself (BlueZ already holding a stale connection to the device from
+    an earlier, uncleanly-closed attempt) and the manual fix
+    (`bluetoothctl disconnect <mac>` on the server).
 - **Python worker (fallback, older servers)** — `ble_worker.py`, **a
   single long-lived** Python process (via `bleak`/BlueZ-DBus), spawned and
   supervised by `lib/bleWorker.js`. Each configured BMS gets its own
