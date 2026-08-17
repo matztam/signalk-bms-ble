@@ -5,6 +5,7 @@ const assert = require('node:assert/strict')
 const BleApiWorker = require('../lib/bleApiWorker')
 const jk = require('../lib/protocols/jk')
 const daly = require('../lib/protocols/daly')
+const wattcycle = require('../lib/protocols/wattcycle')
 
 function createFakeHandle () {
   const handle = {
@@ -76,6 +77,26 @@ test('subscribes to a Daly device with a periodic write descriptor', async () =>
   assert.equal(descriptor.periodicWrite.length, 1)
   assert.equal(descriptor.periodicWrite[0].uuid, daly.WRITE_CHAR)
   assert.equal(descriptor.periodicWrite[0].intervalMs, daly.REQUEST_INTERVAL_MS)
+  assert.equal(descriptor.periodicWrite[0].withResponse, false)
+})
+
+test('subscribes to a WattCycle device with an auth init write and a periodic write descriptor', async () => {
+  const { app, subscribeGATT } = createApp()
+  const worker = new BleApiWorker({ app, devices: [{ id: 'wattcycle1', type: 'wattcycle', address: '11:22:33:44:55:68' }], onReading: () => {} })
+
+  worker.start()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const [descriptor] = subscribeGATT.mock.calls[0].arguments
+  assert.equal(descriptor.service, wattcycle.SERVICE_UUID)
+  assert.deepEqual(descriptor.notify, [wattcycle.NOTIFY_CHAR])
+  assert.equal(descriptor.init.length, 1)
+  assert.equal(descriptor.init[0].uuid, wattcycle.AUTH_CHAR)
+  assert.equal(descriptor.init[0].data, wattcycle.AUTH_KEY.toString('hex'))
+  assert.equal(descriptor.init[0].withResponse, false)
+  assert.equal(descriptor.periodicWrite.length, 1)
+  assert.equal(descriptor.periodicWrite[0].uuid, wattcycle.WRITE_CHAR)
+  assert.equal(descriptor.periodicWrite[0].intervalMs, wattcycle.REQUEST_INTERVAL_MS)
   assert.equal(descriptor.periodicWrite[0].withResponse, false)
 })
 

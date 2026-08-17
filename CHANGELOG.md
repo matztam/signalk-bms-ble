@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+- Add WattCycle/XDZN Smart BMS support (WATT protocol), requested in
+  [#1](https://github.com/matztam/signalk-bms-ble/issues/1). New device
+  type `wattcycle`. Ported from the independently-authored,
+  reverse-engineered
+  [wattcycle_ble](https://github.com/qume/wattcycle_ble) library.
+  **Unverified against real hardware** - no WattCycle/XDZN device is
+  currently available to this project; the frame parsing was checked
+  against a real-world data sample a user posted in the issue, but the
+  live BLE connection sequence (including an authentication write this
+  BMS needs that JK/Daly don't) has not been tested end to end. See
+  `diag/findings/PROTOCOL_NOTES.md` for a known risk specific to the
+  server-BLE-API backend: its `GATTSubscriptionDescriptor` can only
+  express "init writes, then subscribe to notifications", the opposite
+  of the order wattcycle_ble's own verified-working implementation
+  uses. The Python fallback backend does not have this risk. If you
+  have this hardware, please test and report back via the issue.
+
 ## 0.2.3
 
 - Fix `capacity.timeRemaining` showing absurd values (e.g. "7.9e+29 h")

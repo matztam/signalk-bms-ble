@@ -1,7 +1,7 @@
 {
   "name": "signalk-bms-ble",
-  "version": "0.2.3",
-  "description": "SignalK plugin reading SOC, voltage and current from JK-BMS and Daly Smart BMS over Bluetooth LE",
+  "version": "0.3.0",
+  "description": "SignalK plugin reading SOC, voltage and current from JK-BMS, Daly Smart BMS and WattCycle/XDZN BMS over Bluetooth LE",
   "main": "index.js",
   "keywords": [
     "signalk-node-server-plugin",

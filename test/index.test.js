@@ -102,7 +102,7 @@ test('schema exposes the device list with sane defaults', () => {
   assert.equal(schema.properties.devices.type, 'array')
   assert.deepEqual(schema.properties.devices.default, [])
   assert.deepEqual(schema.properties.devices.items.required, ['id', 'type', 'address'])
-  assert.deepEqual(schema.properties.devices.items.properties.type.enum, ['jk', 'daly'])
+  assert.deepEqual(schema.properties.devices.items.properties.type.enum, ['jk', 'daly', 'wattcycle'])
 })
 
 test('start() with no devices reports status and does not spawn a worker', () => {

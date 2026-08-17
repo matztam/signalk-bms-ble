@@ -147,6 +147,16 @@ class Protocol:
     #: for single-characteristic protocols like JK's UART passthrough).
     write_char = None
 
+    #: Optional separate characteristic to write an authentication key to
+    #: once, right after notifications are enabled and before the first
+    #: request - see WattcycleProtocol, the only protocol needing this so
+    #: far. None for protocols with no auth step.
+    auth_char = None
+    #: Bytes to write to auth_char, and how long to wait afterward before
+    #: sending the first request() - see WattcycleProtocol.
+    auth_key = None
+    auth_settle_s = 0
+
     def request(self) -> bytes:
         """Bytes to write to trigger a status response."""
         raise NotImplementedError
@@ -200,6 +210,10 @@ class Protocol:
         async with setup_lock:
             await client.start_notify(self.notify_char, handler)
             try:
+                if self.auth_char is not None:
+                    await client.write_gatt_char(self.auth_char, self.auth_key, response=False)
+                    if self.auth_settle_s:
+                        await asyncio.sleep(self.auth_settle_s)
                 await client.write_gatt_char(write_char, self.request(), response=False)
                 for extra in self.extra_requests():
                     try:
@@ -382,11 +396,168 @@ class DalyProtocol(Protocol):
         }
 
 
+class WattcycleProtocol(Protocol):
+    """WattCycle/XDZN BMS (WATT protocol). Service 0xFFF0, notify 0xFFF1,
+    write 0xFFF2, auth 0xFFFA. Ported from
+    github.com/qume/wattcycle_ble (PROTOCOL.md + protocol.py) - like
+    lib/protocols/wattcycle.js, UNVERIFIED against real hardware (no
+    device available). See that file's top comment for the full
+    reasoning. Requested in
+    github.com/matztam/signalk-bms-ble/issues/1.
+
+    Unlike jk.js/daly.js's port to bleApiWorker.js, this protocol's
+    auth_char/auth_key/auth_settle_s hooks on the Protocol base class
+    let this path reproduce wattcycle_ble's exact verified-working
+    sequence (notify enabled, then auth write, then a settle delay,
+    then the first request) - the ordering risk documented in
+    wattcycle.js's top comment is specific to the server-BLE-API
+    backend's GATTSubscriptionDescriptor, which cannot express that
+    ordering. This Python fallback path does not have that risk.
+    """
+
+    notify_char = "0000fff1-0000-1000-8000-00805f9b34fb"
+    write_char = "0000fff2-0000-1000-8000-00805f9b34fb"
+    auth_char = "0000fffa-0000-1000-8000-00805f9b34fb"
+    auth_key = b"HiLink"
+    auth_settle_s = 0.5
+
+    FRAME_HEAD = 0x7E
+    FRAME_HEAD_ALT = 0x1E
+    FRAME_TAIL = 0x0D
+    MIN_FRAME_SIZE = 11
+    DP_ANALOG_QUANTITY = 0x8C
+
+    # Same as DalyProtocol - WattCycle answers a request once and goes
+    # quiet, it does not free-run.
+    request_interval_s = 5
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    @staticmethod
+    def _crc16_modbus(data: bytes) -> int:
+        # Identical algorithm to DalyProtocol._crc16_modbus - see
+        # wattcycle.js's crc16Modbus comment for why this standard
+        # Modbus CRC16 matches wattcycle_ble's table-based
+        # implementation despite looking different at a glance.
+        crc = 0xFFFF
+        for b in data:
+            crc ^= b
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        return crc & 0xFFFF
+
+    def request(self) -> bytes:
+        frame = bytes([0x7E, 0x00, 0x01, 0x03, 0x00, self.DP_ANALOG_QUANTITY, 0x00, 0x00])
+        crc = self._crc16_modbus(frame)
+        return frame + bytes([crc & 0xFF, (crc >> 8) & 0xFF, self.FRAME_TAIL])
+
+    def feed(self, chunk: bytes):
+        self._buf += chunk
+        if len(self._buf) < 8:
+            return None
+        if self._buf[0] not in (self.FRAME_HEAD, self.FRAME_HEAD_ALT):
+            idx = next(
+                (i for i, b in enumerate(self._buf) if b in (self.FRAME_HEAD, self.FRAME_HEAD_ALT)),
+                None,
+            )
+            if idx is None:
+                self._buf.clear()
+                return None
+            del self._buf[:idx]
+            if len(self._buf) < 8:
+                return None
+
+        data_len = (self._buf[6] << 8) | self._buf[7]
+        total = data_len + self.MIN_FRAME_SIZE
+        if len(self._buf) < total:
+            return None
+
+        frame = bytes(self._buf[:total])
+        del self._buf[:total]
+
+        if frame[-1] != self.FRAME_TAIL:
+            return None
+        if frame[3] == 0x86:  # device-reported error
+            return None
+
+        crc_expected = frame[total - 3] | (frame[total - 2] << 8)
+        crc_actual = self._crc16_modbus(frame[: total - 3])
+        if crc_expected != crc_actual:
+            return None
+
+        start_address = (frame[4] << 8) | frame[5]
+        if start_address != self.DP_ANALOG_QUANTITY:
+            return None
+
+        return self._parse_analog_quantity(frame[8 : 8 + data_len])
+
+    @staticmethod
+    def _read_signed_watt_current(data: bytes, offset: int):
+        b0 = data[offset]
+        b1 = data[offset + 1]
+        is_negative = (b0 & 0x80) != 0
+        has_decimal = (b0 & 0x40) != 0
+        raw = b1 | ((b0 & 0x3F) << 8)
+        current = raw / 10.0 if has_decimal else float(raw)
+        return -current if is_negative else current
+
+    def _parse_analog_quantity(self, data: bytes) -> dict:
+        off = 0
+
+        def read_u16():
+            nonlocal off
+            v = (data[off] << 8) | data[off + 1]
+            off += 2
+            return v
+
+        cell_count = data[off]
+        off += 1
+        cell_voltages = []
+        for _ in range(cell_count):
+            cell_voltages.append(read_u16() / 1000)
+
+        temperature_count = data[off]
+        off += 1
+        # (raw - 2730) / 10 -> degC: WattCycle encodes temperature in
+        # deciKelvin, not the raw-minus-40 degC offset JK/Daly use.
+        mos_temperature_c = (read_u16() - 2730) / 10
+        pcb_temperature_c = (read_u16() - 2730) / 10
+        cell_temperatures_c = []
+        for _ in range(temperature_count - 2):
+            cell_temperatures_c.append((read_u16() - 2730) / 10)
+
+        current = self._read_signed_watt_current(data, off)
+        off += 2
+        pack_voltage = read_u16() / 100
+        remaining_capacity_ah = read_u16() / 10
+        full_charge_capacity_ah = read_u16() / 10
+        off += 2  # cycle count - not currently surfaced
+        off += 2  # design (nameplate) capacity - not currently surfaced
+        soc = read_u16()
+
+        reading = {
+            "cellVoltages": cell_voltages,
+            "packVoltage": pack_voltage,
+            "current": current,
+            "soc": soc,
+            "fullChargeCapacityAh": full_charge_capacity_ah,
+            "remainingCapacityAh": remaining_capacity_ah,
+            "mosTemperatureC": mos_temperature_c,
+            "batteryTemperatureC": pcb_temperature_c,
+        }
+        if cell_temperatures_c:
+            reading["batteryTemperaturesC"] = cell_temperatures_c
+
+        return reading
+
+
 # Registry mapping the "type" field in BMS_DEVICES to a Protocol subclass.
 # To support a new brand: write a Protocol subclass above and add it here.
 PROTOCOLS = {
     "jk": JkProtocol,
     "daly": DalyProtocol,
+    "wattcycle": WattcycleProtocol,
 }
 
 

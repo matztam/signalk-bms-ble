@@ -431,3 +431,87 @@ hypothetischen 20A Entladestrom → ~13.9h, exakt wie erwartet).
 
 **Noch offen**: Deploy auf den Pi 4B und Sichtprüfung im Garmin-Plotter,
 ob der bisherige Zeit-Platzhalter jetzt einen Wert anzeigt.
+
+## WattCycle/XDZN-BMS-Unterstützung hinzugefügt — UNVERIFIZIERT (2026-08-17)
+
+Ausgangspunkt: [Issue #1](https://github.com/matztam/signalk-bms-ble/issues/1)
+bittet um Unterstützung für WattCycle-BMS. Anders als beim
+Temperatur-Feature gibt es hier eine vollständige, unabhängig
+reverse-engineerte Referenzbibliothek
+(github.com/qume/wattcycle_ble, inkl. `PROTOCOL.md`), UND der
+Issue-Ersteller hat bereits erfolgreich echte Rohdaten von drei eigenen
+Geräten gepostet (`wattcycle-ble read` CLI-Output). Trotzdem: **kein
+WattCycle-Gerät stand für diese Implementierung selbst zur Verfügung**,
+die folgende Portierung ist entsprechend nicht gegen echte Hardware
+verifiziert, nur gegen die gepostete Beispielausgabe gegengetestet
+(Parser liefert exakt SOC 70%, 13.15V, 4 Zellen ~3.287V, 69.9/100.0 Ah,
+MOS 31.1°C/PCB 33.6°C/Zelle1 30.1°C — passend zum Issue-Kommentar).
+
+### Protokoll-Zusammenfassung (WATT-Protokoll, Hersteller XDZN)
+
+Quelle: `PROTOCOL.md` und `src/wattcycle_ble/protocol.py` aus dem
+Referenz-Repo, reverse-engineered aus der `com.gz.wattcycle`-Android-App.
+
+- Service `0xFFF0`, Notify `0xFFF1`, Write `0xFFF2`, **zusätzlich ein
+  Auth-Characteristic `0xFFFA`** — weder JK noch Daly brauchen das.
+- Frame-Format: `[HEAD=0x7E] [VER] [ADDR] [FUNC] [START_ADDR:2] [DATA_LEN:2] [DATA...] [CRC16:2] [TAIL=0x0D]`,
+  CRC16 über alles vor CRC/TAIL.
+- CRC-Algorithmus: die Referenzimplementierung nutzt 512-Byte-Lookup-Tabellen
+  mit ungewöhnlichem Init (`crc_hi=0xFF, crc_lo=0xFF`), das sieht auf den
+  ersten Blick nach einer WattCycle-spezifischen Variante aus — **ist es
+  aber nicht**: durch Testvektor-Vergleich offline bestätigt, dass das
+  Ergebnis exakt mit dem bereits vorhandenen Standard-Modbus-CRC16
+  (`crc=0xFFFF` init, Polynom `0xA001`, wie in `daly.js` verwendet)
+  übereinstimmt. `wattcycle.js`/`ble_worker.py`s `WattcycleProtocol`
+  nutzen deshalb dieselbe kompakte Implementierung wie `daly.js`, keine
+  512-Byte-Tabelle im Code.
+- Hauptdatenpunkt: "Analog Quantity", DP-Adresse `140`/`0x8C`. Enthält
+  Zellspannungen (variable Anzahl, erstes Byte = Zellenzahl),
+  Temperatursensoren (variable Anzahl: MOS + PCB + N weitere
+  Zellsensoren), Strom (bit-gepackt, siehe unten), Packspannung,
+  Restkapazität, Gesamtkapazität, Zyklenzahl, Nennkapazität, SOC.
+- Temperatur-Kodierung: `(raw − 2730) / 10 → °C` (Dezikelvin) — **anders**
+  als JK/Daly's `raw − 40 → °C`.
+- Strom-Kodierung: 2 Bytes, bit-gepackt (`byte0` Bit 7 = Vorzeichen,
+  Bit 6 = Dezimalflag, Bits 5-0 + `byte1` = Rohbetrag,
+  `/10` falls Dezimalflag gesetzt). Ungewöhnlich im Vergleich zu JK/Daly's
+  einfachen linearen Registern.
+- SOC ist ein **direkter Prozentwert (0-100)**, nicht `x0.1` wie bei
+  Daly.
+- Frame-Reassemblierung nötig: BLE-MTU (~20 Bytes) reicht nicht für eine
+  komplette Antwort, `expected_length = uint16_be(data[6:8]) + 11`.
+
+### Auth-Handshake — bekanntes Risiko für den Server-BLE-API-Pfad
+
+Laut `client.py`s verifiziertem `connect()`-Ablauf: **erst**
+`start_notify(FFF1)`, **dann** `write_gatt_char(FFFA, "HiLink", response=False)`,
+**dann** `sleep(0.5)`, erst danach der erste Read-Request.
+
+Unser `GATTSubscriptionDescriptor`-Modell (`app.bleApi.subscribeGATT()`,
+siehe `LocalBLEProvider.executeGATTLifecycle()` im signalk-server-Fork)
+führt `init`-Writes aber **vor** dem `notify`-Subscribe aus (Schritt 5
+vor Schritt 6) — exakt umgekehrt zur verifizierten Referenzreihenfolge,
+und es gibt keine Möglichkeit, eine Wartezeit zwischen zwei
+`init`-Writes oder zwischen `init` und `notify` einzufügen. Der
+Auth-Write wurde trotzdem als `init`-Eintrag auf `FFFA` umgesetzt (die
+einzige verfügbare Stelle für einen einmaligen Write auf ein beliebiges
+Characteristic) — ob das reale Gerät diese abweichende Reihenfolge
+toleriert, ist ungetestet. Falls nicht, müsste signalk-server selbst um
+eine Ordnungs-/Delay-Option im Descriptor erweitert werden (analog zu
+unserem PR #2956 für den anderen BLE-API-Bug).
+
+**Der Python-Fallback-Pfad (`ble_worker.py`) hat dieses Risiko nicht** —
+`Protocol.stream()` macht bereits `start_notify` vor dem ersten Request
+(vor dieser Änderung schon so implementiert, für JK/Daly). Für WattCycle
+wurde die Basisklasse um optionale `auth_char`/`auth_key`/`auth_settle_s`-Hooks
+erweitert, die exakt zwischen `start_notify` und dem ersten `request()`
+greifen — reproduziert die verifizierte Referenzreihenfolge 1:1,
+inklusive der 0.5s Wartezeit.
+
+### SignalK-Pfade
+
+Nutzt dieselben Pfade wie das Temperatur-Feature (`temperature`,
+`batteryTemperatures.<n>.temperature`, `mosTemperature`) — WattCycle
+liefert MOS/PCB/Zell-Temperaturen im selben Frame wie die übrigen
+Werte, kein zusätzlicher Request nötig (anders als bei Daly, wo die
+MOSFET-Temperatur eine größere Registeranfrage brauchte).

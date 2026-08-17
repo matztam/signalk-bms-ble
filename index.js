@@ -11,7 +11,10 @@ const BleApiWorker = require('./lib/bleApiWorker')
 // key + label here so it shows up in the config UI.
 const KNOWN_TYPES = {
   jk: 'JK-BMS (JK02 protocol)',
-  daly: 'Daly Smart BMS (D2 protocol)'
+  daly: 'Daly Smart BMS (D2 protocol)',
+  // Unverified against real hardware - see lib/protocols/wattcycle.js's
+  // top comment and github.com/matztam/signalk-bms-ble/issues/1.
+  wattcycle: 'WattCycle/XDZN BMS (WATT protocol) - unverified'
 }
 
 module.exports = function (app) {

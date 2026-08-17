@@ -1,8 +1,9 @@
 # signalk-bms-ble
 
 SignalK plugin that reads state of charge, voltage, current, cell voltages
-and capacity from JK-BMS and Daly Smart BMS battery management systems over
-Bluetooth LE, and publishes them under `electrical.batteries.<id>.*`.
+and capacity from JK-BMS, Daly Smart BMS and WattCycle/XDZN battery
+management systems over Bluetooth LE, and publishes them under
+`electrical.batteries.<id>.*`.
 
 ## Supported hardware
 
@@ -10,9 +11,18 @@ Bluetooth LE, and publishes them under `electrical.batteries.<id>.*`.
   Verified against JK-B2A8S20P hardware.
 - **Daly Smart BMS**, D2 dialect (Modbus-RTU-style framing over BLE, service
   `0xFFF0`). Verified against BMS-ST103-303E hardware.
+- **WattCycle/XDZN Smart BMS**, WATT protocol (Modbus-RTU-style framing
+  over BLE, service `0xFFF0`). **Unverified against real hardware** —
+  ported from the independently-authored, reverse-engineered
+  [wattcycle_ble](https://github.com/qume/wattcycle_ble) library rather
+  than tested against a device this project has access to; see
+  `diag/findings/PROTOCOL_NOTES.md` and
+  [#1](https://github.com/matztam/signalk-bms-ble/issues/1). If you have
+  a WattCycle/XDZN device, please try it and report back whether it
+  works.
 
-Both protocols have variants across firmware/board generations that use
-different byte offsets for the same fields (see
+All three protocols have variants across firmware/board generations that
+use different byte offsets for the same fields (see
 `diag/findings/PROTOCOL_NOTES.md`). The plugin validates every parsed
 reading against physically sane ranges (SOC 0-100%, voltage, current) and
 drops + reports readings that fail this check instead of silently
@@ -114,7 +124,7 @@ Each entry in the device list needs:
 | Field | Meaning |
 |---|---|
 | `id` | SignalK battery instance id, used as `electrical.batteries.<id>.*` — must be unique across devices, e.g. `house1` |
-| `type` | `jk` or `daly` |
+| `type` | `jk`, `daly`, or `wattcycle` (unverified, see "Supported hardware" above) |
 | `address` | Bluetooth MAC address of the BMS, e.g. `11:22:33:44:55:66` |
 | `enabled` | Uncheck to stop polling a device without deleting its config |
 
