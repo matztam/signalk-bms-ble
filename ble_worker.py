@@ -301,7 +301,11 @@ class JkProtocol(Protocol):
             v = u32(pos)
             return v - 0x100000000 if v & 0x80000000 else v
 
-        return {
+        def i16(pos):
+            v = frame[pos] | (frame[pos + 1] << 8)
+            return v - 0x10000 if v & 0x8000 else v
+
+        reading = {
             "cellVoltages": cell_voltages,
             "packVoltage": u32(118 + off) / 1000,
             "current": i32(126 + off) / 1000,
@@ -317,6 +321,25 @@ class JkProtocol(Protocol):
             # 130, unshifted) - both agree (105.000 Ah on this hardware).
             "fullChargeCapacityAh": u32(146 + off) / 1000,
         }
+
+        # Temperature fields, unverified against real hardware - mirrors
+        # lib/protocols/jk.js's readTempC; see that file's comment for the
+        # documented standard-layout positions this is based on.
+        def temp_c(standard_offset):
+            t = i16(standard_offset + off) / 10
+            return t if -60 < t < 150 else None
+
+        mos_temp_c = temp_c(144)
+        if mos_temp_c is not None:
+            reading["mosTemperatureC"] = mos_temp_c
+        temp1_c = temp_c(162)
+        if temp1_c is not None:
+            reading["batteryTemperatureC"] = temp1_c
+        temp2_c = temp_c(164)
+        if temp2_c is not None:
+            reading["batteryTemperature2C"] = temp2_c
+
+        return reading
 
 
 class DalyProtocol(Protocol):
@@ -340,8 +363,13 @@ class DalyProtocol(Protocol):
                 crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
         return crc & 0xFFFF
 
+    # 80 registers (0x0000-0x004F) instead of the 62 (0x3E) used before the
+    # temperature feature - see lib/protocols/daly.js's REGISTER_COUNT
+    # comment for the register-map source and reasoning.
+    REGISTER_COUNT = 0x50
+
     def request(self) -> bytes:
-        frame = bytes([0xD2, 0x03, 0x00, 0x00, 0x00, 0x3E])
+        frame = bytes([0xD2, 0x03, 0x00, 0x00, 0x00, self.REGISTER_COUNT])
         crc = self._crc16_modbus(frame)
         return frame + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
@@ -360,15 +388,28 @@ class DalyProtocol(Protocol):
             return None
         return self._parse(payload)
 
+    # Daly encodes temperatures as raw - 40 -> degC. Unverified against
+    # real hardware - mirrors lib/protocols/daly.js's readTempC.
+    TEMP_ZERO_OFFSET = 40
+
     def _parse(self, payload: bytes) -> dict:
         def reg(i):
             pos = i * 2
+            if pos + 1 >= len(payload):
+                return None
             return (payload[pos] << 8) | payload[pos + 1]
 
-        cell_count = reg(0x31)
+        def temp_c(i):
+            raw = reg(i)
+            if raw is None:
+                return None
+            t = raw - self.TEMP_ZERO_OFFSET
+            return t if -40 < t < 150 else None
+
+        cell_count = reg(0x31) or 0
         cell_voltages = [reg(i) / 1000 for i in range(cell_count)]
 
-        return {
+        reading = {
             "cellVoltages": cell_voltages,
             "packVoltage": reg(0x28) / 10,
             "current": (reg(0x29) - self.CURRENT_OFFSET) / 10,
@@ -380,6 +421,22 @@ class DalyProtocol(Protocol):
             # JkProtocol's fullChargeCapacityAh below.
             "fullChargeCapacityAh": reg(0x30) / 10,
         }
+
+        # Registers 0x20-0x27 (up to 8 sensors) - see
+        # lib/protocols/daly.js's parse() for details.
+        battery_temps_c = [t for i in range(8) if (t := temp_c(0x20 + i)) is not None]
+        if battery_temps_c:
+            reading["batteryTemperatureC"] = battery_temps_c[0]
+            reading["batteryTemperaturesC"] = battery_temps_c
+
+        # Register 0x42 - only present when the request read 80 registers
+        # (see REGISTER_COUNT above); reg()'s length guard handles a reply
+        # from firmware that only honors the smaller 62-register form.
+        mos_temp_c = temp_c(0x42)
+        if mos_temp_c is not None:
+            reading["mosTemperatureC"] = mos_temp_c
+
+        return reading
 
 
 # Registry mapping the "type" field in BMS_DEVICES to a Protocol subclass.

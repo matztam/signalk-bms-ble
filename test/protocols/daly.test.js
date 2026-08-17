@@ -68,6 +68,72 @@ test('negative current (discharge) decodes correctly around the offset', () => {
   assert.equal(reading.current, -12.4)
 })
 
+test('parses battery temperature sensors (registers 0x20-0x27) into batteryTemperatureC/batteryTemperaturesC', () => {
+  const frame = buildResponseFrame({
+    0x20: 65, // raw - 40 -> 25 degC
+    0x21: 63, // 23 degC
+    0x28: 134,
+    0x29: CURRENT_OFFSET + 189,
+    0x2a: 561,
+    0x30: 2800,
+    0x31: 4
+  }, 0x50)
+
+  const reading = daly.parseNotification(frame)
+
+  assert.ok(reading)
+  assert.equal(reading.batteryTemperatureC, 25)
+  assert.deepEqual(reading.batteryTemperaturesC, [25, 23])
+})
+
+test('parses MOSFET temperature (register 0x42) when the frame reads 80 registers', () => {
+  const frame = buildResponseFrame({
+    0x28: 134,
+    0x29: CURRENT_OFFSET + 189,
+    0x2a: 561,
+    0x30: 2800,
+    0x31: 4,
+    0x42: 78 // raw - 40 -> 38 degC
+  }, 0x50)
+
+  const reading = daly.parseNotification(frame)
+
+  assert.ok(reading)
+  assert.equal(reading.mosTemperatureC, 38)
+})
+
+test('MOSFET temperature is omitted (not a crash) when the reply only has the old 62-register form', () => {
+  const frame = buildResponseFrame({
+    0x28: 134,
+    0x29: CURRENT_OFFSET + 189,
+    0x2a: 561,
+    0x30: 2800,
+    0x31: 4
+  }, 0x3e)
+
+  const reading = daly.parseNotification(frame)
+
+  assert.ok(reading)
+  assert.equal('mosTemperatureC' in reading, false)
+})
+
+test('an implausible raw temperature (e.g. an unpopulated sensor register) is omitted', () => {
+  const frame = buildResponseFrame({
+    0x20: 0xffff, // way outside the plausible range once the -40 offset is applied
+    0x28: 134,
+    0x29: CURRENT_OFFSET + 189,
+    0x2a: 561,
+    0x30: 2800,
+    0x31: 4
+  }, 0x50)
+
+  const reading = daly.parseNotification(frame)
+
+  assert.ok(reading)
+  assert.equal('batteryTemperatureC' in reading, false)
+  assert.equal('batteryTemperaturesC' in reading, false)
+})
+
 test('rejects a frame with an invalid CRC', () => {
   const frame = buildResponseFrame({ 0x28: 134, 0x31: 0 })
   frame[frame.length - 1] ^= 0xff // corrupt the low CRC byte
@@ -87,9 +153,9 @@ test('rejects a truncated frame shorter than its declared byte count', () => {
   assert.equal(daly.parseNotification(frame.subarray(0, frame.length - 5)), null)
 })
 
-test('buildRequest() produces a CRC-valid read-62-registers-from-0 command', () => {
+test('buildRequest() produces a CRC-valid read-80-registers-from-0 command (0x50, extended from the original 0x3E to include the MOSFET temperature register)', () => {
   const request = daly.buildRequest()
-  assert.deepEqual([...request.subarray(0, 6)], [0xd2, 0x03, 0x00, 0x00, 0x00, 0x3e])
+  assert.deepEqual([...request.subarray(0, 6)], [0xd2, 0x03, 0x00, 0x00, 0x00, 0x50])
   const crc = crc16Modbus(request.subarray(0, 6))
   assert.equal(request[6], crc & 0xff)
   assert.equal(request[7], (crc >> 8) & 0xff)

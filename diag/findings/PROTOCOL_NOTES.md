@@ -431,3 +431,84 @@ hypothetischen 20A Entladestrom → ~13.9h, exakt wie erwartet).
 
 **Noch offen**: Deploy auf den Pi 4B und Sichtprüfung im Garmin-Plotter,
 ob der bisherige Zeit-Platzhalter jetzt einen Wert anzeigt.
+
+## Temperatur-Felder (MOSFET + Batterie) hinzugefügt — UNVERIFIZIERT (2026-08-17)
+
+Ausgangspunkt: [Issue #2](https://github.com/matztam/signalk-bms-ble/issues/2)
+bittet um Temperaturauslesung ("bms semiconductor and batterie
+temperatures"), um bei einem 190A-Wassermacher-Entladestrom frühzeitig
+Übertemperatur zu erkennen. Zum Zeitpunkt der Implementierung waren keine
+BMS-Geräte für Live-Traffic erreichbar (Boot nicht zugänglich) — die
+folgenden Offsets sind **ausschließlich aus öffentlich dokumentierten
+Protokoll-Referenzen abgeleitet, nicht gegen echte Hardware verifiziert**,
+anders als alle anderen Felder in diesem Dokument. Bitte bei Gelegenheit
+gegen echte Geräte gegentesten und diesen Abschnitt entsprechend
+aktualisieren.
+
+### JK-BMS (JK02, `FIELD_OFFSET=32`)
+
+Quelle: github.com/syssi/esphome-jk-bms `docs/protocol-design-ble.md`,
+Abschnitt "Cell Info Frame Specification (JK02_32S)" — dieselbe
+Referenztabelle, gegen die `packVoltage`/`current`/`soc`/
+`fullChargeCapacityAh` oben bereits verifiziert wurden (alle vier landen
+exakt auf `dokumentierter Standard-Offset + 32`, was hohe Zuversicht
+gibt, dass dieselbe Verschiebung auch für die folgenden Felder gilt):
+
+- Power tube (MOSFET) temperature: Standard-Offset 144-145 → bei uns
+  **176-177** (`int16 LE`, ×0.1 → °C)
+- Temperature Sensor 1: Standard-Offset 162-163 → bei uns **194-195**
+- Temperature Sensor 2: Standard-Offset 164-165 → bei uns **196-197**
+
+Implementiert in `lib/protocols/jk.js`'s `readTempC()` (und gespiegelt in
+`ble_worker.py`'s `JkProtocol._parse()`). Werte außerhalb -60..150°C
+werden als "Sensor nicht angeschlossen/nicht plausibel" verworfen statt
+veröffentlicht (analog zum `implausibleReadingReason`-Muster für
+SOC/Spannung/Strom, aber pro-Feld statt die ganze Reading verwerfend, da
+ein fehlender Temperatursensor kein Grund ist, SOC/Spannung/Strom auch
+zu verwerfen).
+
+### Daly Smart BMS (D2-Dialekt)
+
+Quelle: github.com/syssi/esphome-daly-bms
+`docs/protocol-register-map.md`. Wichtiger Unterschied zu JK: die
+MOSFET-Temperatur liegt in "Real-time Block 2", das laut Doku ("D2 reads
+this block in a single frame (62 or 80 registers from 0x0000)") einen
+**größeren Request** braucht als die bisherigen 62 Register — der
+Request wurde deshalb von `0x3E` (62) auf `0x50` (80) erweitert
+(`REGISTER_COUNT` in `daly.js`/`ble_worker.py`).
+
+- Register `0x20`-`0x27` (bis zu 8 Sensoren): Batterietemperatur,
+  bereits im alten 62-Register-Bereich enthalten
+- Register `0x2D`/`0x2E`: Max./Min.-Batterietemperatur (nicht
+  implementiert — nur Sensor 1 wird als "die" Batterietemperatur
+  veröffentlicht, alle vorhandenen Sensoren zusätzlich als Liste)
+- Register `0x42`: **MOSFET-Temperatur** — braucht die Request-Erweiterung
+  auf 80 Register, sonst liegt das Register außerhalb der Antwort
+- Alle Temperatur-Register: `raw − 40 → °C` (fixer Offset, damit ein
+  vorzeichenloses Register auch negative Temperaturen abbilden kann)
+
+**Risiko, falls diese Registeradressen für unsere konkreten Geräte nicht
+stimmen sollten**: Da wir die bisherigen Felder (SOC/Spannung/Strom/
+Kapazität) bereits erfolgreich bei 62 Registern lasen, ist unklar, ob
+unsere spezifische Firmware/Hardware auch bei einer 80-Register-Anfrage
+noch korrekt (und nicht mit einem Fehler oder abgeschnitten) antwortet —
+das ist der einzige Teil dieser Änderung, der auch die *bestehenden*
+Felder theoretisch beeinträchtigen könnte, falls die Geräte strikt nur
+62 Register unterstützen. `parseNotification`/`feed()` sind aber bereits
+so geschrieben, dass eine kürzere Antwort (falls die Geräte den größeren
+Request ignorieren und trotzdem nur 62 Register zurückschicken) weiterhin
+korrekt geparst wird — nur `mosTemperatureC` bliebe dann unveröffentlicht
+statt eines Absturzes oder korrupter Werte in den übrigen Feldern.
+
+### SignalK-Pfade
+
+- `electrical.batteries.<id>.temperature` — Standard-SignalK-Pfad
+  (`dcQualities`, Definition aus `SignalK/specification`), Kelvin,
+  einzelner Wert (Batterietemperatur-Sensor 1)
+- `electrical.batteries.<id>.batteryTemperatures.<n>.temperature` —
+  Plugin-Erweiterungspfad für zusätzliche Sensoren (analog zu
+  `cellVoltages.<n>.voltage`)
+- `electrical.batteries.<id>.mosTemperature` — Plugin-Erweiterungspfad,
+  da die SignalK-Spec keinen Standard-Pfad für MOSFET-/
+  Halbleitertemperatur pro Batterie kennt (nur `regulatorTemperature`
+  bei anderen elektrischen Geräten wie Chargern, nicht bei `batteries`)

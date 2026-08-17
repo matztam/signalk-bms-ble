@@ -309,6 +309,59 @@ test('capacity fields are omitted entirely when the BMS reports no capacity', ()
   assert.equal('electrical.batteries.house1.capacity.timeRemaining' in values, false)
 })
 
+test('publishes electrical.batteries.<id>.temperature in Kelvin from batteryTemperatureC', () => {
+  const app = createApp()
+  const plugin = pluginFactory(app)
+  plugin.start({ devices: [{ id: 'house1', type: 'jk', address: '11:11:11:11:11:11' }] })
+
+  FakeBleWorker.lastInstance.onReading({ id: 'house1', soc: 50, packVoltage: 13.3, current: -1, batteryTemperatureC: 25 })
+
+  const values = deltaValues(app)
+  assert.ok(Math.abs(values['electrical.batteries.house1.temperature'] - 298.15) < 1e-9)
+})
+
+test('publishes per-sensor battery temperatures when the BMS reports more than one', () => {
+  const app = createApp()
+  const plugin = pluginFactory(app)
+  plugin.start({ devices: [{ id: 'house1', type: 'daly', address: '11:11:11:11:11:11' }] })
+
+  FakeBleWorker.lastInstance.onReading({
+    id: 'house1',
+    soc: 50,
+    packVoltage: 13.3,
+    current: -1,
+    batteryTemperatureC: 25,
+    batteryTemperaturesC: [25, 23]
+  })
+
+  const values = deltaValues(app)
+  assert.ok(Math.abs(values['electrical.batteries.house1.batteryTemperatures.1.temperature'] - 298.15) < 1e-9)
+  assert.ok(Math.abs(values['electrical.batteries.house1.batteryTemperatures.2.temperature'] - 296.15) < 1e-9)
+})
+
+test('publishes electrical.batteries.<id>.mosTemperature (extension path) in Kelvin from mosTemperatureC', () => {
+  const app = createApp()
+  const plugin = pluginFactory(app)
+  plugin.start({ devices: [{ id: 'house1', type: 'jk', address: '11:11:11:11:11:11' }] })
+
+  FakeBleWorker.lastInstance.onReading({ id: 'house1', soc: 50, packVoltage: 13.3, current: -1, mosTemperatureC: 42.5 })
+
+  const values = deltaValues(app)
+  assert.ok(Math.abs(values['electrical.batteries.house1.mosTemperature'] - 315.65) < 1e-9)
+})
+
+test('temperature paths are omitted entirely when the BMS reports no temperature fields', () => {
+  const app = createApp()
+  const plugin = pluginFactory(app)
+  plugin.start({ devices: [{ id: 'house1', type: 'jk', address: '11:11:11:11:11:11' }] })
+
+  FakeBleWorker.lastInstance.onReading({ id: 'house1', soc: 50, packVoltage: 13.3, current: -1 })
+
+  const values = deltaValues(app)
+  assert.equal('electrical.batteries.house1.temperature' in values, false)
+  assert.equal('electrical.batteries.house1.mosTemperature' in values, false)
+})
+
 test('current smoothing converges toward a step change rather than jumping instantly', async () => {
   const app = createApp()
   const plugin = pluginFactory(app)

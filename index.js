@@ -64,7 +64,13 @@ module.exports = function (app) {
     const cells = Array.isArray(r.cellVoltages) && r.cellVoltages.length > 0
       ? `\n      cells: ${r.cellVoltages.map((v) => `${v.toFixed(3)} V`).join(', ')}`
       : ''
-    return `${statusIcon(r)} ${id} — ${r.soc}% SOC, ${r.packVoltage.toFixed(2)} V, ${r.current.toFixed(2)} A${cells}\n      (last update ${r.at})`
+    const temps = []
+    if (Array.isArray(r.batteryTemperaturesC) && r.batteryTemperaturesC.length > 0) {
+      temps.push(`battery: ${r.batteryTemperaturesC.map((t) => `${t.toFixed(1)}°C`).join(', ')}`)
+    }
+    if (typeof r.mosTemperatureC === 'number') temps.push(`MOSFET: ${r.mosTemperatureC.toFixed(1)}°C`)
+    const tempsText = temps.length > 0 ? `\n      temp: ${temps.join(', ')}` : ''
+    return `${statusIcon(r)} ${id} — ${r.soc}% SOC, ${r.packVoltage.toFixed(2)} V, ${r.current.toFixed(2)} A${cells}${tempsText}\n      (last update ${r.at})`
   }
 
   // A function (not a static object) so the admin UI re-fetches it on every
@@ -268,6 +274,31 @@ module.exports = function (app) {
       msg.cellVoltages.forEach((v, i) => {
         if (isFiniteNumber(v)) values.push({ path: `${path}.cellVoltages.${i + 1}.voltage`, value: v })
       })
+    }
+
+    // SignalK's electrical.batteries.<id>.temperature is a single Kelvin
+    // value ("Temperature measured within or on the device", the
+    // dcQualities definition shared across electrical devices - see
+    // schemas/groups/electrical.json in SignalK/specification). The BMS's
+    // MOSFET/semiconductor temperature has no standard battery-schema
+    // path, so it's published under a plugin-specific extension path
+    // instead (mosTemperature) - generic SignalK clients won't render it,
+    // but it's there for anyone consuming this plugin's own paths
+    // directly. Both are unverified against real hardware (see jk.js's/
+    // daly.js's readTempC comments) - added for
+    // github.com/matztam/signalk-bms-ble/issues/2, please report back
+    // whether the values look right on your device.
+    const CELSIUS_TO_KELVIN = 273.15
+    if (isFiniteNumber(msg.batteryTemperatureC)) {
+      values.push({ path: `${path}.temperature`, value: msg.batteryTemperatureC + CELSIUS_TO_KELVIN })
+    }
+    if (Array.isArray(msg.batteryTemperaturesC)) {
+      msg.batteryTemperaturesC.forEach((t, i) => {
+        if (isFiniteNumber(t)) values.push({ path: `${path}.batteryTemperatures.${i + 1}.temperature`, value: t + CELSIUS_TO_KELVIN })
+      })
+    }
+    if (isFiniteNumber(msg.mosTemperatureC)) {
+      values.push({ path: `${path}.mosTemperature`, value: msg.mosTemperatureC + CELSIUS_TO_KELVIN })
     }
 
     // BMS-reported current full-charge capacity (not a fixed nameplate

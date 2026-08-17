@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+- Add battery and MOSFET/semiconductor temperature readings for both
+  JK-BMS and Daly Smart BMS, requested in
+  [#2](https://github.com/matztam/signalk-bms-ble/issues/2). New paths:
+  `electrical.batteries.<id>.temperature` (standard SignalK path, the
+  primary battery temperature sensor, Kelvin),
+  `electrical.batteries.<id>.batteryTemperatures.<n>.temperature`
+  (per-sensor, for BMS models reporting more than one), and
+  `electrical.batteries.<id>.mosTemperature` (plugin-specific extension
+  path - the SignalK battery schema has no standard field for this).
+  Daly's request now reads 80 registers instead of 62 to reach the
+  MOSFET-temperature register.
+  **These fields are unverified against real hardware** - based on the
+  documented JK02/Daly-D2 register layouts (see
+  `diag/findings/PROTOCOL_NOTES.md` for sources), not a live device this
+  project currently has access to. If you have a device with temperature
+  sensors, please open an issue confirming whether the values look right.
+
 ## 0.2.3
 
 - Fix `capacity.timeRemaining` showing absurd values (e.g. "7.9e+29 h")

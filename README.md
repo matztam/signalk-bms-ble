@@ -149,9 +149,21 @@ Per configured device, under `electrical.batteries.<id>.*`:
 | `capacity.actual` | Current full-charge capacity in J (BMS-reported Ah × voltage × 3600 — not a fixed nameplate value, drifts with cell aging/calibration) | when the BMS reports a capacity |
 | `capacity.remaining` | Remaining capacity in J (SOC × `capacity.actual`) | same as above |
 | `capacity.timeRemaining` | Time to empty in s | same as above, only while discharging with the smoothed current below -0.05 A; uses a smoothed current (~45s time constant) so brief load spikes don't make the value jump around, and the 0.05 A floor avoids a technically-finite but meaningless huge value (e.g. hundreds of thousands of hours) when the smoothed current is merely very close to zero |
+| `temperature` | Battery temperature in K (standard SignalK battery path) | when the BMS reports at least one battery temperature sensor |
+| `batteryTemperatures.<n>.temperature` | Individual battery temperature sensors in K, for BMS models with more than one | same as above, when more than one sensor is present |
+| `mosTemperature` | MOSFET/semiconductor temperature in K (**plugin-specific extension path** — not part of the SignalK battery schema, so generic SignalK clients won't render it; useful for anyone consuming this plugin's own paths directly, e.g. to watch for overheating under heavy sustained load) | when the BMS reports a MOSFET temperature |
 
 `capacity.timeRemaining` is what an NMEA2000 plotter (PGN 127506) shows as
 "time remaining" next to SOC/voltage/current.
+
+**Temperature readings are unverified against real hardware** (added in
+response to [#2](https://github.com/matztam/signalk-bms-ble/issues/2),
+based on the documented JK02/Daly-D2 register layouts rather than a live
+device this project has access to) — see
+`diag/findings/PROTOCOL_NOTES.md` and the comments in
+`lib/protocols/jk.js`/`lib/protocols/daly.js` for the sources. If you have
+a device with temperature sensors, please open an issue confirming
+whether the values look right (or wrong) for you.
 
 ## Status page
 

@@ -178,6 +178,17 @@
     const capacityAhValue = hasCapacity ? actualJ / voltage / 3600 : null
     const timeRemainingText = Number.isFinite(timeRemainingS) ? formatDuration(timeRemainingS) : null
 
+    const KELVIN_TO_CELSIUS = -273.15
+    const batteryTempK = battery?.temperature?.value
+    const mosTempK = battery?.mosTemperature?.value
+    const tempMetrics = []
+    if (Number.isFinite(batteryTempK)) {
+      tempMetrics.push(`<div class="metric"><span class="label">Battery temp</span><span class="value">${(batteryTempK + KELVIN_TO_CELSIUS).toFixed(1)} °C</span></div>`)
+    }
+    if (Number.isFinite(mosTempK)) {
+      tempMetrics.push(`<div class="metric"><span class="label">MOSFET temp</span><span class="value">${(mosTempK + KELVIN_TO_CELSIUS).toFixed(1)} °C</span></div>`)
+    }
+
     const cellVoltages = battery?.cellVoltages && typeof battery.cellVoltages === 'object'
       ? Object.entries(battery.cellVoltages)
         .map(([n, c]) => [Number(n), c?.voltage?.value])
@@ -201,6 +212,7 @@
           ? `<div class="metric"><span class="label">Capacity</span><span class="value">${capacityAhValue.toFixed(1)} Ah</span></div>
              <div class="metric"><span class="label">Time remaining</span><span class="value">${timeRemainingText || '—'}</span></div>`
           : ''}
+        ${tempMetrics.join('')}
       </div>
       ${cells}
       <p class="at">Last update: ${latest ? formatTime(latest) : '?'}</p>

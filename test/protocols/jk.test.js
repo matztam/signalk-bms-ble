@@ -16,7 +16,10 @@ function sum8 (buf) {
 // Builds a synthetic, checksum-valid 300-byte JK02 cell-info frame with
 // the given field values, at the same byte offsets jk.js reads from
 // (verified against real hardware - see diag/findings/PROTOCOL_NOTES.md).
-function buildCellInfoFrame ({ cellVoltagesMv, packVoltageMv, currentMa, soc, fullChargeCapacityMah }) {
+// mosTempC1/temp1C1/temp2C1 (x0.1 degC, matching jk.js's readTempC) are
+// optional - the documented standard-layout positions (144/162/164) are
+// unverified against real hardware, unlike the fields above.
+function buildCellInfoFrame ({ cellVoltagesMv, packVoltageMv, currentMa, soc, fullChargeCapacityMah, mosTempC1, temp1C1, temp2C1 }) {
   const frame = Buffer.alloc(INFO_FRAME_LEN)
   frame.writeUInt8(0x55, 0)
   frame.writeUInt8(0xaa, 1)
@@ -31,6 +34,9 @@ function buildCellInfoFrame ({ cellVoltagesMv, packVoltageMv, currentMa, soc, fu
   frame.writeInt32LE(currentMa | 0, 126 + off)
   frame.writeUInt8(soc, 141 + off)
   frame.writeUInt32LE(fullChargeCapacityMah >>> 0, 146 + off)
+  if (mosTempC1 !== undefined) frame.writeInt16LE(mosTempC1, 144 + off)
+  if (temp1C1 !== undefined) frame.writeInt16LE(temp1C1, 162 + off)
+  if (temp2C1 !== undefined) frame.writeInt16LE(temp2C1, 164 + off)
 
   frame.writeUInt8(sum8(frame.subarray(0, INFO_FRAME_LEN - 1)), INFO_FRAME_LEN - 1)
   return frame
@@ -54,6 +60,61 @@ test('parses a complete single-chunk cell-info frame', () => {
   assert.equal(reading.current, -12.4)
   assert.equal(reading.soc, 78)
   assert.equal(reading.fullChargeCapacityAh, 105)
+})
+
+test('parses MOSFET and battery temperature fields when present', () => {
+  const frame = buildCellInfoFrame({
+    cellVoltagesMv: [3325, 3328, 3327, 3330],
+    packVoltageMv: 13310,
+    currentMa: -12400,
+    soc: 78,
+    fullChargeCapacityMah: 105000,
+    mosTempC1: 253, // 25.3 degC
+    temp1C1: 241, // 24.1 degC
+    temp2C1: -15 // -1.5 degC
+  })
+
+  const reading = new JkFrameAssembler().feed(frame)
+
+  assert.ok(reading)
+  assert.equal(reading.mosTemperatureC, 25.3)
+  assert.equal(reading.batteryTemperatureC, 24.1)
+  assert.equal(reading.batteryTemperature2C, -1.5)
+})
+
+test('omits temperature fields when the frame does not set them (reads as 0 degC, not implausible but also not meaningfully present)', () => {
+  const frame = buildCellInfoFrame({
+    cellVoltagesMv: [3325, 3328, 3327, 3330],
+    packVoltageMv: 13310,
+    currentMa: -12400,
+    soc: 78,
+    fullChargeCapacityMah: 105000
+  })
+
+  const reading = new JkFrameAssembler().feed(frame)
+
+  // 0 raw -> 0.0 degC, which is inside the plausible range, so this
+  // documents current behavior (a genuinely absent sensor reading 0 is
+  // indistinguishable from a real 0 degC reading) rather than asserting
+  // omission - readers should treat 0.0 degC from this field with the
+  // same skepticism as any other unverified-offset reading.
+  assert.equal(reading.mosTemperatureC, 0)
+})
+
+test('an implausible raw temperature value (e.g. a genuinely disconnected sensor) is omitted', () => {
+  const frame = buildCellInfoFrame({
+    cellVoltagesMv: [3325, 3328, 3327, 3330],
+    packVoltageMv: 13310,
+    currentMa: -12400,
+    soc: 78,
+    fullChargeCapacityMah: 105000,
+    mosTempC1: -32768 // int16 minimum -> -3276.8 degC, clearly not a real reading
+  })
+
+  const reading = new JkFrameAssembler().feed(frame)
+
+  assert.ok(reading)
+  assert.equal('mosTemperatureC' in reading, false)
 })
 
 test('reassembles a frame split across multiple BLE notification chunks', () => {
