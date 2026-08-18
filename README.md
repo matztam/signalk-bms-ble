@@ -66,6 +66,39 @@ Restart signalk-server, then enable the plugin under **Server → Plugin
 Config** and add your devices to the device list (see "Finding your
 device's Bluetooth address" below).
 
+### Testing an unreleased branch
+
+To try a fix or feature branch (e.g. to test something before it's
+released, or to help verify an issue fix), the branch has to replace the
+plugin **in the exact location SignalK actually loads plugins from** —
+`~/.signalk/node_modules/signalk-bms-ble/`. Cloning the repo somewhere
+else (e.g. your home directory) does nothing: SignalK never looks there,
+so it silently keeps running whatever was installed before (or nothing),
+which looks like "the install worked but BLE never connects" with no
+indication of what actually went wrong.
+
+```
+cd ~/.signalk/node_modules
+mv signalk-bms-ble signalk-bms-ble.bak   # keep the working install as a fallback
+git clone -b <branch-name> https://github.com/matztam/signalk-bms-ble.git
+```
+
+Restart signalk-server. To go back to the released version afterward:
+
+```
+cd ~/.signalk/node_modules
+rm -rf signalk-bms-ble
+mv signalk-bms-ble.bak signalk-bms-ble
+```
+
+Restart signalk-server again.
+
+If you're on the Python-worker fallback path (older signalk-server, see
+"Two BLE backends" below), the plugin creates its own `.venv/` on first
+start inside whichever directory it's actually running from - so this
+works the same way whether installed via `npm install` or `git clone`,
+as long as the directory itself is in the right place.
+
 ## Configuration
 
 Each entry in the device list needs:
