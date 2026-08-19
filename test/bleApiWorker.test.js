@@ -239,7 +239,7 @@ test('stop() unsubscribes from the advertisement stream', async () => {
   assert.equal(unsubscribeAdvertisements.mock.calls.length, 1)
 })
 
-test('subscribeGATT failing with "No provider ... can see" repeatedly past the threshold gets a stale-connection hint appended', async () => {
+test('subscribeGATT failing with "No provider ... can see" repeatedly past the threshold gets a stale-connection hint appended, and keeps getting it on every failure after that', async () => {
   const { app } = createApp({
     subscribeGATTImpl: async () => {
       throw new Error('No provider with GATT support and available slots can see 11:22:33:44:55:66')
@@ -251,20 +251,27 @@ test('subscribeGATT failing with "No provider ... can see" repeatedly past the t
   worker.start()
   await new Promise((resolve) => setImmediate(resolve))
 
-  // Drive 12 consecutive failures (STALE_CONNECTION_HINT_THRESHOLD) by
-  // forcing each retry backoff to elapse immediately.
-  for (let i = 0; i < 11; i++) {
+  // Drive 14 consecutive failures (2 past STALE_CONNECTION_HINT_THRESHOLD)
+  // by forcing each retry backoff to elapse immediately.
+  for (let i = 0; i < 13; i++) {
     for (const entry of worker._retryTimers) entry.clear()
     await new Promise((resolve) => setImmediate(resolve))
   }
 
-  assert.equal(readings.length, 12)
-  // Only the 12th failure should carry the hint - not every one of them.
+  assert.equal(readings.length, 14)
+  // Before the threshold: no hint yet, this is still "normal" retrying.
   for (let i = 0; i < 11; i++) {
     assert.doesNotMatch(readings[i].error, /stale connection/)
   }
-  assert.match(readings[11].error, /device not seen for over a minute/)
-  assert.match(readings[11].error, /bluetoothctl disconnect 11:22:33:44:55:66/)
+  // From the threshold onward: the hint must stay visible on every
+  // subsequent failure, not just the one attempt where the counter
+  // happened to equal the threshold exactly - a user checking the status
+  // page/log a minute later or five minutes later should see it either
+  // way, not just someone watching at the exact right moment.
+  for (let i = 11; i < 14; i++) {
+    assert.match(readings[i].error, /device not seen for over a minute/)
+    assert.match(readings[i].error, /bluetoothctl disconnect 11:22:33:44:55:66/)
+  }
 
   await worker.stop()
 })
